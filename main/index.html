@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>S3 Audio 设置</title>
+<style>
+:root{color-scheme:dark;--bg:#111613;--panel:#1b211d;--field:#131915;--line:#354039;--text:#eef3ed;--muted:#acb8ac;--accent:#c1f498;--error:#ffb4a8}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,"Microsoft YaHei",sans-serif}
+main{max-width:880px;margin:0 auto;padding:44px 22px}h1{font-size:clamp(28px,5vw,42px);line-height:1.15;margin:0 0 16px;letter-spacing:-.04em}
+h2{font-size:18px;margin:0 0 17px}a{color:var(--accent)}.status{display:flex;flex-wrap:wrap;gap:8px 22px;color:var(--muted);margin:0 0 24px}
+.status strong{color:var(--text);font-weight:550}.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}.card{padding:22px;border:1px solid var(--line);background:var(--panel);border-radius:13px}
+.card:last-child{grid-column:1/-1}.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.field{display:grid;gap:6px;margin:0 0 14px}
+label,.hint{color:var(--muted)}.hint{margin:0 0 12px}.current{font-weight:650;margin:0 0 12px}
+input,select,button{font:inherit;min-height:42px;border-radius:7px}.field input,.field select{width:100%;background:var(--field);color:var(--text);border:1px solid var(--line);padding:7px 9px}
+input[type=color]{padding:4px}input[type=range]{padding:0;accent-color:var(--accent)}button{cursor:pointer;border:0;background:var(--accent);color:#182113;font-weight:700;padding:8px 15px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:3px}button:disabled{opacity:.55;cursor:default}.feedback{margin:8px 0 0;color:var(--accent);min-height:1.5em;overflow-wrap:anywhere}
+.feedback.error,#offline{color:var(--error)}#offline:empty{display:none}.wide{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
+@media(max-width:590px){main{padding-top:25px}.grid,.wide{grid-template-columns:1fr}.card:last-child{grid-column:auto}}
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1 id="name">S3 Audio</h1>
+<div class="status">
+<span>局域网 <strong id="ip">—</strong></span>
+<span>投放来源 <strong id="source">—</strong></span>
+<span>AirPlay 1 <strong id="airplay">—</strong></span>
+</div>
+<p id="offline" role="status"></p>
+</header>
+<div class="grid">
+<section class="card">
+<h2>Wi-Fi</h2>
+<p class="hint" id="wifi-state">正在读取网络状态…</p>
+<form id="wifi">
+<label class="field">Wi-Fi 名称<input required name="ssid" maxlength="32" autocomplete="off" placeholder="输入 2.4 GHz Wi-Fi 名称"></label>
+<label class="field">Wi-Fi 密码<input name="password" type="password" maxlength="64" autocomplete="new-password" placeholder="开放网络可留空"></label>
+<button>保存并重启</button>
+<p class="feedback" role="status"></p>
+</form>
+</section>
+<section class="card">
+<h2>USB DAC 输出</h2>
+<p class="current" id="active-format">—</p>
+<p class="hint" id="usb-state">正在读取 DAC 状态…</p>
+<form id="audio">
+<div class="row">
+<label class="field">采样率<select id="rate"></select></label>
+<label class="field">位深<select id="bits"></select></label>
+</div>
+<button>应用输出格式</button>
+<p class="feedback" role="status"></p>
+</form>
+</section>
+<section class="card">
+<h2>GPIO48 · WS2812</h2>
+<form id="led">
+<div class="wide">
+<label class="field">模式<select name="mode"><option value="0">关闭</option><option value="1">常亮</option><option value="2">设备状态</option></select></label>
+<label class="field">颜色<input name="color" type="color" value="#18a8ff"></label>
+<label class="field">亮度 <output id="brightness-label"></output><input name="brightness" type="range" min="0" max="100" value="20"></label>
+</div>
+<button>应用灯光</button>
+<p class="feedback" role="status"></p>
+</form>
+</section>
+</div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const wifi = $('wifi'), audio = $('audio'), led = $('led');
+const rate = $('rate'), bits = $('bits');
+let state, audioDirty = false, initial = true, restarting = false;
+function options(select, values, selected, label) {
+  select.replaceChildren(...values.map(value => new Option(label(value), String(value))));
+  if (values.includes(selected)) select.value = String(selected);
+}
+function formats(savedRate, savedBits) {
+  const rates = [...new Set(state.formats.map(item => item.rate))].sort((a,b) => a-b);
+  if (savedRate && !rates.includes(savedRate)) savedRate = 0;
+  options(rate, [0, ...rates], savedRate, value => value ? (value/1000) + ' kHz' : '自动');
+  const depths = state.formats.filter(item => item.rate === Number(rate.value)).map(item => item.bits);
+  const values = [...new Set(depths)].sort((a,b) => a-b);
+  options(bits, values.length ? values : [0], savedBits, value => value ? value + ' bit' : '自动');
+  bits.disabled = values.length === 0;
+}
+function render(data) {
+  const selectedRate = Number(rate.value), selectedBits = Number(bits.value);
+  state = data;
+  state.formats = Array.isArray(data.formats) ? data.formats : [];
+  $('name').textContent = data.name;
+  $('ip').textContent = data.ip || '未连接';
+  $('source').textContent = data.source || '待机';
+  $('airplay').textContent = data.airplay ? '接收服务已启动' : '未启动';
+  $('active-format').textContent = data.activeRate ? (data.activeRate/1000) + ' kHz / ' + data.activeBits + ' bit' : '暂无输出';
+  $('usb-state').textContent = (data.usb || 'USB 音频服务未就绪') + (data.uac ? ' · UAC' + data.uac : '');
+  $('wifi-state').textContent = data.ip ? data.wifi + ' · ' + data.ip :
+    (data.wifi ? '正在尝试连接 ' + data.wifi : '等待配置') + ' · 热点 ' + data.hotspot;
+  if (initial) {
+    wifi.elements.ssid.value = data.wifi;
+    led.elements.mode.value = data.mode;
+    led.elements.color.value = data.color;
+    led.elements.brightness.value = data.brightness;
+    initial = false;
+  }
+  $('brightness-label').textContent = led.elements.brightness.value + '%';
+  formats(audioDirty ? selectedRate : data.rate, audioDirty ? selectedBits : data.bits);
+}
+rate.addEventListener('change', () => { audioDirty = true; formats(Number(rate.value), Number(bits.value)); });
+bits.addEventListener('change', () => { audioDirty = true; });
+led.elements.brightness.addEventListener('input', () => {
+  $('brightness-label').textContent = led.elements.brightness.value + '%';
+});
+async function poll() {
+  if (restarting) return;
+  try {
+    const response = await fetch('/api/status', {cache:'no-store'});
+    if (!response.ok) throw Error();
+    render(await response.json());
+    $('offline').textContent = '';
+  } catch (_) {
+    $('offline').textContent = '与播放器的连接已断开。';
+  } finally {
+    if (!restarting) setTimeout(poll, 2500);
+  }
+}
+function submit(form, data, done) {
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    const button = form.querySelector('button');
+    const feedback = form.querySelector('.feedback');
+    button.disabled = true;
+    feedback.classList.remove('error');
+    feedback.textContent = '正在保存…';
+    try {
+      const response = await fetch('/api/' + form.id, {
+        method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data())
+      });
+      if (!response.ok) throw Error(await response.text());
+      const result = await response.json();
+      feedback.textContent = done(result);
+      render(result);
+    } catch (_) {
+      feedback.classList.add('error');
+      feedback.textContent = '保存失败。请检查输入和设备连接。';
+    } finally {
+      button.disabled = restarting;
+    }
+  });
+}
+submit(wifi, () => ({ssid:wifi.elements.ssid.value,password:wifi.elements.password.value}), result => {
+  restarting = true;
+  wifi.elements.password.value = '';
+  return '设备正在重启。连接同一 Wi-Fi 后访问 http://' + result.hostname + '.local/ 或设备获得的 IP。';
+});
+submit(audio, () => ({rate:Number(rate.value),bits:Number(bits.value)}), () => {
+  audioDirty = false;
+  return '已保存。实际输出格式将在上方更新。';
+});
+submit(led, () => ({mode:Number(led.elements.mode.value),color:led.elements.color.value,
+  brightness:Number(led.elements.brightness.value)}), () => '灯光设置已应用。');
+poll();
+</script>
+</body>
+</html>

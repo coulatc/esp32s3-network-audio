@@ -1,0 +1,6 @@
+/build*/
+!/build-local.ps1
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+/.vscode/

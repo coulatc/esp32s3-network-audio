@@ -49,7 +49,7 @@ char *strextract(char *s1, char *beg, char *end);
 
 // HTTP utilities
 bool http_parse(int sock, char *method, key_data_t *rkd, char **body, int *len);
-char *http_send(int sock, char *method, key_data_t *rkd);
+char *http_send(int sock, char *method, key_data_t *rkd, const char *body);
 
 // Key-data utilities
 char *kd_lookup(key_data_t *kd, char *key);

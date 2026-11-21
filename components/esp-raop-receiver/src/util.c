@@ -382,32 +382,24 @@ static int read_line(int fd, char *line, int maxlen, int timeout)
 
 
 /*----------------------------------------------------------------------------*/
-char *http_send(int sock, char *method, key_data_t *rkd)
+char *http_send(int sock, char *method, key_data_t *rkd, const char *body)
 {
-	unsigned sent, len;
-	char *resp = kd_dump(rkd);
-	if (!resp) {
-		resp = strdup("\r\n");
-		if (!resp) return NULL;
-	}
-	char *data = malloc(strlen(method) + 2 + strlen(resp) + 2 + 1);
-	if (!data) { NFREE(resp); return NULL; }
-
-	len = sprintf(data, "%s\r\n%s\r\n", method, resp);
-	NFREE(resp);
-
-	LOG_SDEBUG("Sending HTTP response, length: %u", len);
-	sent = send(sock, data, len, 0);
-
-	if (sent != len) {
-		LOG_ERROR("HTTP send() error:%s %u (strlen=%u), errno=%d (%s)",
-		          data, sent, len, errno, strerror(errno));
-		NFREE(data);
-	} else {
-		LOG_SDEBUG("HTTP send successful: %u bytes", sent);
-	}
-
-	return data;
+    char *headers = kd_dump(rkd);
+    const char *payload = body ? body : "";
+    char *data = NULL;
+    int len = asprintf(&data, "%s\r\n%s\r\n%s", method, headers ? headers : "", payload);
+    free(headers);
+    if (len < 0) return NULL;
+    for (int sent = 0; sent < len; ) {
+        int count = send(sock, data + sent, len - sent, 0);
+        if (count <= 0) {
+            LOG_ERROR("RTSP send failed: %s", strerror(errno));
+            free(data);
+            return NULL;
+        }
+        sent += count;
+    }
+    return data;
 }
 
 

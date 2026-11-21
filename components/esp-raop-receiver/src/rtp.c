@@ -103,7 +103,6 @@ _Static_assert(DECODE_STACK_WORDS * sizeof(StackType_t) == DECODE_STACK_SIZE, "d
 
 enum { DATA = 0, CONTROL, TIMING };
 
-static const u8_t silence_frame[MAX_PACKET] = { 0 };
 uint32_t buffer_frames = ((150 * RAOP_SAMPLE_RATE * 2) / (352 * 100));
 
 typedef u16_t seq_t;
@@ -129,7 +128,9 @@ typedef struct rtp_s {
 #endif
 	bool decrypt;
 	u8_t *decrypt_buf;
-	u32_t frame_size, frame_duration;
+	u32_t frame_size;
+    bool pcm;
+    uint8_t payload_type;
 	u32_t in_frames, out_frames;
 	struct in_addr host;
 	struct sockaddr_in rtp_host;
@@ -165,7 +166,13 @@ typedef struct rtp_s {
 
 	struct alac_codec_s *alac_codec;
 	int first_seqno;
-	enum { RTP_WAIT, RTP_STREAM, RTP_PLAY } state;
+	enum { RTP_IDLE, RTP_WAIT, RTP_PLAY } state;
+    bool play_announced;
+    bool local_clock;
+    unsigned generation;
+    uint32_t first_packet_at;
+    uint32_t local_time;
+    uint32_t local_rtp;
     int stalled;
 	raop_data_cb_t data_cb;
 	raop_cmd_cb_t cmd_cb;
@@ -179,9 +186,9 @@ typedef struct rtp_s {
 	// forwarding in seqno order.
 	#define RAWQ_DEPTH 256
 	struct raw_pkt {
+        unsigned generation;
 		seq_t    seqno;
 		unsigned rtptime;
-		uint8_t  first;
 		int      len;
 		uint8_t  data[MAX_PACKET];
 	} *rawq;                       // RAWQ_DEPTH entries (PSRAM)
@@ -216,7 +223,7 @@ static void 	buffer_release(abuf_t *audio_buffer);
 static void 	buffer_reset(abuf_t *audio_buffer);
 static void 	buffer_push_packet(rtp_t *ctx);
 static void     decode_thread_func(void *arg);
-static void     rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first, const char *data, int len);
+static void     rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, const char *data, int len);
 static bool 	rtp_request_resend(rtp_t *ctx, seq_t first, seq_t last);
 static bool 	rtp_request_timing(rtp_t *ctx);
 static int	  	seq_order(seq_t a, seq_t b);
@@ -267,14 +274,15 @@ static struct alac_codec_s* alac_init(int fmtp[12]) {
 }
 
 /*---------------------------------------------------------------------------*/
-rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv, char *fmtpstr,
+rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv, const char *fmtpstr, bool pcm, uint8_t payload_type,
 								short unsigned pCtrlPort, short unsigned pTimingPort,
 								uint8_t *buffer, size_t size,
 								raop_cmd_cb_t cmd_cb, raop_data_cb_t data_cb)
 {
     int fmtp[12];
-    char *parsed = fmtpstr;
-    for (unsigned n = 0; n < 12; n++) {
+    const char *parsed = fmtpstr;
+    unsigned frame_size = 352;
+    for (unsigned n = 0; !pcm && n < 12; n++) {
         if (!parsed) return (rtp_resp_t){0};
         char *end;
         long value = strtol(parsed, &end, 10);
@@ -285,14 +293,17 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
         fmtp[n] = (int)value;
         parsed = end;
     }
-    if (fmtp[1] < 1 || fmtp[1] > 352 || fmtp[2] != 0 || fmtp[3] != 16 ||
-        fmtp[4] > 255 || fmtp[5] > 255 || fmtp[6] > 31 || fmtp[7] != 2 ||
-        fmtp[8] > 65535 || fmtp[11] != 44100 || !buffer ||
-        size < (size_t)fmtp[1] * 4 * BUFFER_FRAMES_MIN) {
-        LOG_ERROR("Unsupported ALAC SDP: %d frames, %d bit, %d channels, %d Hz; supplied buffer=%zu",
-                  fmtp[1], fmtp[3], fmtp[7], fmtp[11], size);
-        return (rtp_resp_t){0};
+    if (!pcm) {
+        if (fmtp[1] < 1 || fmtp[1] > 352 || fmtp[2] != 0 || fmtp[3] != 16 ||
+            fmtp[4] > 255 || fmtp[5] > 255 || fmtp[6] > 31 || fmtp[7] != 2 ||
+            fmtp[8] > 65535 || fmtp[11] != RAOP_SAMPLE_RATE) {
+            LOG_ERROR("Unsupported ALAC format: %d frames, %d bit, %d channels, %d Hz",
+                      fmtp[1], fmtp[3], fmtp[7], fmtp[11]);
+            return (rtp_resp_t){0};
+        }
+        frame_size = fmtp[1];
     }
+    if (!buffer || size < (size_t)frame_size * 4 * BUFFER_FRAMES_MIN) return (rtp_resp_t){0};
     int i;
 	bool rc = true;
 	rtp_t *ctx = heap_caps_calloc(1, sizeof(rtp_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -375,12 +386,13 @@ rtp_resp_t rtp_init(struct in_addr host, int latency, char *aeskey, char *aesiv,
 	}
 
 
-	ctx->frame_size = fmtp[1];
-	ctx->frame_duration = (ctx->frame_size * 1000) / RAOP_SAMPLE_RATE;
-
-	// alac decoder
-	ctx->alac_codec = alac_init(fmtp);
-	rc &= ctx->alac_codec != NULL;
+    ctx->frame_size = frame_size;
+    ctx->pcm = pcm;
+    ctx->payload_type = payload_type;
+    if (!pcm) {
+        ctx->alac_codec = alac_init(fmtp);
+        rc &= ctx->alac_codec != NULL;
+    }
 
 	buffer_alloc(ctx->audio_buffer, ctx->frame_size*4, buffer, size);
 	ctx->user_buffer = buffer;
@@ -550,42 +562,39 @@ void rtp_end(rtp_t *ctx)
 }
 
 /*---------------------------------------------------------------------------*/
-bool rtp_flush(rtp_t *ctx, unsigned short seqno, unsigned int rtptime, bool exit_locked)
+static void reset_timeline(rtp_t *ctx, int seqno)
+{
+    buffer_reset(ctx->audio_buffer);
+    __atomic_add_fetch(&ctx->generation, 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&ctx->first_seqno, seqno, __ATOMIC_RELEASE);
+    ctx->state = RTP_WAIT;
+    ctx->play_announced = false;
+    ctx->local_clock = false;
+}
+
+bool rtp_flush(rtp_t *ctx, int seqno, unsigned rtptime, bool exit_locked)
 {
     pthread_mutex_lock(&ctx->ab_mutex);
-
-    // always store flush seqno as we only want stricly above it, even when equal to RECORD
-    __atomic_store_n(&ctx->first_seqno, seqno, __ATOMIC_RELEASE);
-    bool flushed = false;
-
-    // no need to stop playing if recent or equal to record - but first_seqno is needed
-    if (ctx->state == RTP_PLAY) {
-        buffer_reset(ctx->audio_buffer);
-        ctx->state = RTP_WAIT;
-        flushed = true;
-        LOG_INFO("[%p]: FLUSH packets below %hu - %u", ctx, seqno, rtptime);
-	}
-
-	if (!exit_locked || !flushed) pthread_mutex_unlock(&ctx->ab_mutex);
-	return flushed;
+    bool active = ctx->state != RTP_IDLE;
+    if (active) {
+        reset_timeline(ctx, seqno);
+        LOG_INFO("RAOP flush: seq=%d timestamp=%lu", seqno, (unsigned long)rtptime);
+    }
+    if (!exit_locked || !active) pthread_mutex_unlock(&ctx->ab_mutex);
+    return active;
 }
 
-/*---------------------------------------------------------------------------*/
-void rtp_flush_release(rtp_t *ctx) {
-	pthread_mutex_unlock(&ctx->ab_mutex);
-}
-
-
-/*---------------------------------------------------------------------------*/
-void rtp_record(rtp_t *ctx, unsigned short seqno, unsigned rtptime) {
-    // state and first_seqno are read/mutated by the decode thread under
-    // ab_mutex; take the same lock here so this RTSP-thread write cannot race
-    // the decode-side state machine.
-    pthread_mutex_lock(&ctx->ab_mutex);
-    __atomic_store_n(&ctx->first_seqno, (seqno || rtptime) ? seqno : -1, __ATOMIC_RELEASE);
-	ctx->state = RTP_WAIT;
+void rtp_flush_release(rtp_t *ctx)
+{
     pthread_mutex_unlock(&ctx->ab_mutex);
-	LOG_DEBUG("[%p]: record %hu - %u", ctx, seqno, rtptime);
+}
+
+void rtp_record(rtp_t *ctx, int seqno, unsigned rtptime)
+{
+    pthread_mutex_lock(&ctx->ab_mutex);
+    reset_timeline(ctx, seqno);
+    pthread_mutex_unlock(&ctx->ab_mutex);
+    LOG_INFO("RAOP record: seq=%d timestamp=%lu", seqno, (unsigned long)rtptime);
 }
 
 /*---------------------------------------------------------------------------*/
@@ -638,83 +647,55 @@ static int seq_order(seq_t a, seq_t b) {
 // store into its out-frames pointer; passing a 16-bit target (as an earlier
 // local revision did via `u16_t *outsize` / `(unsigned int*) outsize`)
 // overflows 2 bytes of the caller's stack on every decoded packet.
-static u16_t alac_decode(rtp_t *ctx, s16_t *dest, char *buf, int len) {
-	unsigned char iv[16];
-	int aeslen;
-	unsigned int frames = 0;
-	if (len <= 0 || len > MAX_PACKET) return 0;
-
-	if (ctx->decrypt) {
-		aeslen = len & ~0xf;
-		memcpy(iv, ctx->aesiv, sizeof(iv));
-#ifdef WIN32
-		AES_cbc_encrypt((unsigned char*)buf, ctx->decrypt_buf, aeslen, &ctx->aes, iv, AES_DECRYPT);
-#else
-		if (aeslen && esp_aes_crypt_cbc(&ctx->aes, ESP_AES_DECRYPT, aeslen, iv,
-		    (unsigned char*)buf, ctx->decrypt_buf) != 0) return 0;
-#endif
-		memcpy(ctx->decrypt_buf+aeslen, buf+aeslen, len-aeslen);
-		if (!alac_to_pcm(ctx->alac_codec, (unsigned char*) ctx->decrypt_buf, len, (unsigned char*) dest, 2, &frames)) {
-			LOG_WARN("[%p]: ALAC decode failed (len=%d)", ctx, len);
-			frames = 0;
-		}
-	} else {
-		if (!alac_to_pcm(ctx->alac_codec, (unsigned char*) buf, len, (unsigned char*) dest, 2, &frames)) {
-			LOG_WARN("[%p]: ALAC decode failed (len=%d)", ctx, len);
-			frames = 0;
-		}
-	}
-
-	return (u16_t)(frames * 4);
+static u16_t decode_audio(rtp_t *ctx, s16_t *dest, char *buf, int len)
+{
+    if (len <= 0 || len > MAX_PACKET) return 0;
+    const uint8_t *payload = (const uint8_t *)buf;
+    if (ctx->decrypt) {
+        const int encrypted = len & ~15;
+        uint8_t iv[16];
+        memcpy(iv, ctx->aesiv, sizeof(iv));
+        if (encrypted && esp_aes_crypt_cbc(&ctx->aes, ESP_AES_DECRYPT, encrypted, iv,
+                                           payload, ctx->decrypt_buf) != 0) return 0;
+        memcpy(ctx->decrypt_buf + encrypted, payload + encrypted, len - encrypted);
+        payload = ctx->decrypt_buf;
+    }
+    if (ctx->pcm) {
+        if (len % 4 || len > ctx->frame_size * 4) return 0;
+        for (int i = 0; i < len / 2; i++) {
+            dest[i] = (s16_t)((uint16_t)payload[i * 2] << 8 | payload[i * 2 + 1]);
+        }
+        return len;
+    }
+    unsigned frames = 0;
+    if (!alac_to_pcm(ctx->alac_codec, payload, len, (unsigned char *)dest, 2, &frames)) {
+        LOG_WARN("ALAC decode failed (len=%d)", len);
+        return 0;
+    }
+    return frames * 4;
 }
 
 
 /*---------------------------------------------------------------------------*/
-static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first, char *data, int len) {
+static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, unsigned generation, char *data, int len) {
 	abuf_t *abuf = NULL;
 
 	pthread_mutex_lock(&ctx->ab_mutex);
 
-    /* if we have received a RECORD with a seqno, then this is the first allowed rtp sequence number
-	 * and we are in RTP_WAIT state. If seqno was 0, then we are waiting for a flush that will tell
-	 * us what should be our first allowed packet but we must accept everything, wait and clean when
-	 * it arrives. This means that first packet moves us to RTP_STREAM state where we accept
-	 * frames but wait for the FLUSH. If this was a FLUSH while playing, then we are also in RTP_WAIT
-	 * state but we do have an allowed seqno and we should not accept any frame before we have it */
+    int fence = __atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE);
+    if (ctx->generation != generation || ctx->state == RTP_IDLE || (fence >= 0 && seq_order(seqno, fence))) {
+        pthread_mutex_unlock(&ctx->ab_mutex);
+        return;
+    }
 
-	// if we have a pending first seqno and we are below, always ignore it
-	if (__atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE) != -1 && seq_order(seqno, __atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE))) {
-		pthread_mutex_unlock(&ctx->ab_mutex);
-		return;
-	}
-
-	if (ctx->state == RTP_WAIT) {
-		ctx->ab_write = seqno - 1;
-		ctx->ab_read = ctx->ab_write + 1;
-		ctx->resent_req = ctx->resent_rec = ctx->silent_frames = ctx->discarded = 0;
-		if (ctx->first_seqno != -1) {
-        	LOG_INFO("[%p]: 1st accepted packet:%d, now playing", ctx, seqno);
-			ctx->state = RTP_PLAY;
-			__atomic_store_n(&ctx->first_seqno, -1, __ATOMIC_RELEASE);
-            u32_t playtime = ctx->synchro.time + ((rtptime - ctx->synchro.rtp) * 10) / (RAOP_SAMPLE_RATE / 100);
-            ctx->cmd_cb(RAOP_INT_PLAY, playtime);
-		} else {
-            ctx->state = RTP_STREAM;
-			LOG_INFO("[%p]: 1st accepted packet:%hu, waiting for FLUSH", ctx, seqno);
-		}
-	} else if (ctx->state == RTP_STREAM && __atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE) != -1 && seq_order(__atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE), seqno + 1)) {
-		// now we're talking, but first discard all packets with a seqno below first_seqno AND not ready
-		while (seq_order(ctx->ab_read, ctx->first_seqno) ||
-			!ctx->audio_buffer[BUFIDX(ctx->ab_read)].ready) {
-			ctx->audio_buffer[BUFIDX(ctx->ab_read)].ready = false;
-			ctx->ab_read++;
-		}
-        LOG_INFO("[%p]: done waiting for FLUSH with packet:%d, now playing starting:%hu", ctx, seqno, ctx->ab_read);
-		ctx->state = RTP_PLAY;
-		__atomic_store_n(&ctx->first_seqno, -1, __ATOMIC_RELEASE);
-        u32_t playtime = ctx->synchro.time + ((rtptime - ctx->synchro.rtp) * 10) / (RAOP_SAMPLE_RATE / 100);
-		ctx->cmd_cb(RAOP_INT_PLAY, playtime);
-	}
+    if (ctx->state == RTP_WAIT) {
+        ctx->ab_write = seqno - 1;
+        ctx->ab_read = seqno;
+        ctx->first_packet_at = gettime_ms();
+        ctx->resent_req = ctx->resent_rec = ctx->silent_frames = ctx->discarded = 0;
+        ctx->state = RTP_PLAY;
+        __atomic_store_n(&ctx->first_seqno, -1, __ATOMIC_RELEASE);
+    }
 
     abuf = ctx->audio_buffer + BUFIDX(seqno);
 
@@ -760,8 +741,8 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 	}
 
 	if (abuf) {
-		abuf->len = alac_decode(ctx, abuf->data, data, len);
-		abuf->ready = 1;
+		abuf->len = decode_audio(ctx, abuf->data, data, len);
+		abuf->ready = abuf->len != 0;
         abuf->missed = 0;
 		// this is the local rtptime when this frame is expected to play
 		abuf->rtptime = rtptime;
@@ -785,7 +766,7 @@ static void buffer_put_packet(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool fi
 // cross-thread read-modify-write on a consumer-owned index. The decoded audio
 // was never going to arrive in time anyway, and buffer_put_packet reorders by
 // seqno and requests resends, so dropping the newest is harmless.
-static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
+static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime,
                       const char *data, int len)
 {
 	if (len > MAX_PACKET) len = MAX_PACKET;
@@ -798,7 +779,7 @@ static void rawq_push(rtp_t *ctx, seq_t seqno, unsigned rtptime, bool first,
 	struct raw_pkt *p = &ctx->rawq[head];
 	p->seqno = seqno;
 	p->rtptime = rtptime;
-	p->first = first ? 1 : 0;
+	p->generation = __atomic_load_n(&ctx->generation, __ATOMIC_ACQUIRE);
 	p->len = len;
 	memcpy(p->data, data, len);
 	__atomic_store_n(&ctx->rawq_head, next, __ATOMIC_RELEASE);
@@ -819,8 +800,11 @@ static void decode_thread_func(void *arg)
 		if (tail == __atomic_load_n(&ctx->rawq_head, __ATOMIC_ACQUIRE)) {
 			// Timeout purely so a stop request is noticed promptly; the normal
 			// wake path is the producer's xTaskNotifyGive().
-			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
-			continue;
+			ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(20));
+            pthread_mutex_lock(&ctx->ab_mutex);
+            buffer_push_packet(ctx);
+            pthread_mutex_unlock(&ctx->ab_mutex);
+            continue;
 		}
 		struct raw_pkt *p = &ctx->rawq[tail];
 		// Skip packets that a FLUSH has already rendered stale. buffer_put_packet
@@ -829,7 +813,7 @@ static void decode_thread_func(void *arg)
 		// have them discarded -- the window the RX-thread design did not have.
 		int fence = __atomic_load_n(&ctx->first_seqno, __ATOMIC_ACQUIRE);
 		if (fence == -1 || !seq_order(p->seqno, fence)) {
-			buffer_put_packet(ctx, p->seqno, p->rtptime, p->first == 1,
+			buffer_put_packet(ctx, p->seqno, p->rtptime, p->generation,
 			                  (char *)p->data, p->len);
 		}
 		__atomic_store_n(&ctx->rawq_tail, (tail + 1) % RAWQ_DEPTH, __ATOMIC_RELAXED);
@@ -846,56 +830,38 @@ static void decode_thread_func(void *arg)
 
 /*---------------------------------------------------------------------------*/
 // push as many frames as possible through callback
-static void buffer_push_packet(rtp_t *ctx) {
-	abuf_t *curframe = NULL;
-	u32_t now, playtime, hold = max((ctx->latency * 1000) / (8 * RAOP_SAMPLE_RATE), 100);
+static void buffer_push_packet(rtp_t *ctx)
+{
+    if (ctx->state != RTP_PLAY || seq_order(ctx->ab_write, ctx->ab_read)) return;
+    uint32_t now = gettime_ms();
+    if (!ctx->play_announced && ctx->synchro.status != (RTP_SYNC | NTP_SYNC)) {
+        if (now - ctx->first_packet_at < 300) return;
+        ctx->local_clock = true;
+        ctx->local_time = now + 75;
+        ctx->local_rtp = ctx->audio_buffer[BUFIDX(ctx->ab_read)].rtptime;
+        LOG_WARN("RAOP source clock unavailable; using local audio timing");
+    }
 
-	// not ready to play yet
-	if (ctx->state != RTP_PLAY || ctx->synchro.status != (RTP_SYNC | NTP_SYNC)) return;
-
-	// there is always at least one frame in the buffer
-	do {
-		// re-evaluate time in loop in case data callback blocks ...
-		now = gettime_ms();
-
-		// try to manage playtime so that we overflow as late as possible if we miss NTP (2^31 / 10 / 44100)
-		curframe = ctx->audio_buffer + BUFIDX(ctx->ab_read);
-		playtime = ctx->synchro.time + ((curframe->rtptime - ctx->synchro.rtp) * 10) / (RAOP_SAMPLE_RATE / 100);
-
-		if (now > playtime) {
-			LOG_DEBUG("[%p]: discarded frame now:%u missed by:%d (W:%hu R:%hu)", ctx, now, now - playtime, ctx->ab_write, ctx->ab_read);
-			ctx->discarded++;
-			curframe->ready = 0;
-		} else if (playtime - now <= hold) {
-			if (curframe->ready) {
-				ctx->data_cb((const u8_t*) curframe->data, curframe->len, playtime);
-				curframe->ready = 0;
-			} else {
-				LOG_DEBUG("[%p]: created zero frame (W:%hu R:%hu)", ctx, ctx->ab_write, ctx->ab_read);
-				ctx->data_cb(silence_frame, ctx->frame_size * 4, playtime);
-				ctx->silent_frames++;
-                curframe->missed = 1;
-			}
-		} else if (curframe->ready) {
-			ctx->data_cb((const u8_t*) curframe->data, curframe->len, playtime);
-			curframe->ready = 0;
-		} else {
-			break;
-		}
-
-		ctx->ab_read++;
-		ctx->out_frames++;
-
-	} while (seq_order(ctx->ab_read, ctx->ab_write));
-
-	if (ctx->out_frames > 1000) {
-		LOG_DEBUG("[%p]: drain [level:%hd head:%d ms] [W:%hu R:%hu] [req:%u sil:%u dis:%u]",
-				ctx, ctx->ab_write - ctx->ab_read, playtime - now, ctx->ab_write, ctx->ab_read,
-				ctx->resent_req, ctx->silent_frames, ctx->discarded);
-		ctx->out_frames = 0;
-	}
-
-	LOG_SDEBUG("playtime %u %d [W:%hu R:%hu] %d", playtime, playtime - now, ctx->ab_write, ctx->ab_read, curframe->ready);
+    while (!seq_order(ctx->ab_write, ctx->ab_read)) {
+        abuf_t *frame = ctx->audio_buffer + BUFIDX(ctx->ab_read);
+        uint32_t base_time = ctx->local_clock ? ctx->local_time : ctx->synchro.time;
+        uint32_t base_rtp = ctx->local_clock ? ctx->local_rtp : ctx->synchro.rtp;
+        int32_t samples = frame->rtptime - base_rtp;
+        uint32_t playtime = base_time + ((int64_t)samples * 1000) / RAOP_SAMPLE_RATE;
+        int32_t ahead = playtime - now;
+        if (ahead > 120 || (!frame->ready && ahead > 15)) break;
+        if (frame->ready && ahead >= -120) {
+            if (!ctx->play_announced) {
+                ctx->play_announced = true;
+                ctx->cmd_cb(RAOP_INT_PLAY, playtime);
+            }
+            ctx->data_cb((const uint8_t *)frame->data, frame->len, playtime);
+        } else {
+            ctx->discarded++;
+        }
+        frame->ready = false;
+        ctx->ab_read++;
+    }
 
     // try to request resend missing packet in order, explore up to 32 frames
     for (int step = max((ctx->ab_write - ctx->ab_read + 1) / 32, 1),
@@ -1002,6 +968,7 @@ static void rtp_thread_func(void *arg) {
 		type = packet[1] & ~0x80;
 		pktp = packet;
 
+		if (idx == DATA && type == ctx->payload_type) type = 0x60;
 		switch (type) {
 			seq_t seqno;
 			unsigned rtptime;
@@ -1015,7 +982,7 @@ static void rtp_thread_func(void *arg) {
 
 			// data packet
 			case 0x60: {
-				if (plen < 12) break;
+				if (plen < 12 || ((unsigned char)pktp[1] & 0x7f) != ctx->payload_type) break;
 				seqno = ntohs(*(u16_t*)(pktp+2));
 				rtptime = ntohl(*(u32_t*)(pktp+4));
 
@@ -1026,7 +993,7 @@ static void rtp_thread_func(void *arg) {
 				LOG_SDEBUG("[%p]: seqno:%hu rtp:%u (type: %x, first: %u)", ctx, seqno, rtptime, type, packet[1] & 0x80);
 
 				// check if packet contains enough content to be reasonable
-				if (plen < 16) break;
+				if (plen < 4) break;
 
 				if ((packet[1] & 0x80) && (type != 0x56)) {
 					LOG_INFO("[%p]: 1st audio packet received", ctx);
@@ -1034,7 +1001,7 @@ static void rtp_thread_func(void *arg) {
 
 				// Enqueue raw packet for the decode thread; do NOT decode here
 				// (decode in the RX thread would stall socket draining).
-				rawq_push(ctx, seqno, rtptime, packet[1] & 0x80, pktp, plen);
+				rawq_push(ctx, seqno, rtptime, pktp, plen);
 
 				break;
 			}
@@ -1064,7 +1031,7 @@ static void rtp_thread_func(void *arg) {
 
 				// re-align timestamp and expected local playback time (and magic 11025 latency)
 				ctx->latency = rtp_now - rtp_now_latency;
-				if (flags == 7 || flags == 4) ctx->latency += 11025;
+				if (flags == 7 && ctx->latency < MIN_LATENCY) ctx->latency += 11025;
 				if (ctx->latency < MIN_LATENCY) ctx->latency = MIN_LATENCY;
 				else if (ctx->latency > MAX_LATENCY) ctx->latency = MAX_LATENCY;
 				ctx->synchro.rtp = rtp_now - ctx->latency;
@@ -1083,7 +1050,6 @@ static void rtp_thread_func(void *arg) {
 				LOG_DEBUG("[%p]: sync packet latency:%d rtp_latency:%u rtp:%u remote ntp:%llx, local time:%u local rtp:%u (now:%u)",
 						  ctx, ctx->latency, rtp_now_latency, rtp_now, remote, ctx->synchro.time, ctx->synchro.rtp, gettime_ms());
 
-				if ((ctx->synchro.status & RTP_SYNC) && (ctx->synchro.status & NTP_SYNC)) ctx->cmd_cb(RAOP_INT_TIMING);
 
 				break;
 			}
@@ -1113,8 +1079,9 @@ static void rtp_thread_func(void *arg) {
 				ctx->timing.remote = remote;
 				ctx->timing.local = reference;
 
-				// now we are synced on NTP (mutex not needed)
+				pthread_mutex_lock(&ctx->ab_mutex);
 				ctx->synchro.status |= NTP_SYNC;
+				pthread_mutex_unlock(&ctx->ab_mutex);
 
 				LOG_DEBUG("[%p]: Timing references local:%llu, remote:%llx (delta:%lld, sum:%lld, adjust:%lld, gaps:%d)",
 						  ctx, ctx->timing.local, ctx->timing.remote);

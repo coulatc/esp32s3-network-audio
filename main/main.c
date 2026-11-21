@@ -4,6 +4,7 @@
 #include <string.h>
 #include "audio.h"
 #include "dlna.h"
+#include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_http_server.h"
 #include "esp_heap_caps.h"
@@ -15,12 +16,16 @@
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 #include "led_strip.h"
 #include "nvs_flash.h"
 #include "player.h"
 
 #define AP_PASSWORD "S3audio-setup"
 #define SETTINGS_KEY "settings_v1"
+#define BOOT_BUTTON GPIO_NUM_0
+#define BOOT_RESET_HOLD_MS 5000
+#define BOOT_BUTTON_POLL_MS 20
 
 typedef struct {
     char ssid[33];
@@ -43,6 +48,7 @@ static raop_handle_t *raop;
 static audio_resampler_t airplay_pcm;
 static TaskHandle_t network_task_handle;
 static bool restarting;
+static SemaphoreHandle_t settings_write_lock;
 
 static void load_settings(void)
 {
@@ -66,6 +72,59 @@ static esp_err_t save_settings(const settings_t *value)
     nvs_close(handle);
     if (err == ESP_OK) settings = *value;
     return err;
+}
+
+static esp_err_t erase_settings(void)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open("s3audio", NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_erase_key(handle, SETTINGS_KEY);
+    if (err == ESP_ERR_NVS_NOT_FOUND) err = ESP_OK;
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static void boot_reset_task(void *unused)
+{
+    const TickType_t poll = pdMS_TO_TICKS(BOOT_BUTTON_POLL_MS);
+    const TickType_t hold = pdMS_TO_TICKS(BOOT_RESET_HOLD_MS);
+
+    // Arm only after release, even if the button was still held at startup.
+    while (gpio_get_level(BOOT_BUTTON) == 0) vTaskDelay(poll);
+    for (;;) {
+        TickType_t pressed_at = xTaskGetTickCount();
+        while (gpio_get_level(BOOT_BUTTON) == 0 &&
+               xTaskGetTickCount() - pressed_at < hold) {
+            vTaskDelay(poll);
+        }
+        if (gpio_get_level(BOOT_BUTTON) != 0) {
+            vTaskDelay(poll);
+            continue;
+        }
+
+        xSemaphoreTake(settings_write_lock, portMAX_DELAY);
+        esp_err_t err = ESP_ERR_INVALID_STATE;
+        if (!restarting) {
+            err = erase_settings();
+            restarting = err == ESP_OK;
+        }
+        xSemaphoreGive(settings_write_lock);
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Factory settings restored. Release BOOT to restart.");
+        } else if (err != ESP_ERR_INVALID_STATE) {
+            ESP_LOGE(TAG, "Could not reset settings: %s", esp_err_to_name(err));
+        }
+
+        // GPIO0 is a boot strapping pin. Wait for a stable release before reboot.
+        unsigned released = 0;
+        while (released < 3) {
+            vTaskDelay(poll);
+            released = gpio_get_level(BOOT_BUTTON) ? released + 1 : 0;
+        }
+        if (err == ESP_OK) esp_restart();
+    }
 }
 
 static void network_event(void *arg, esp_event_base_t base, int32_t id, void *data)
@@ -333,13 +392,22 @@ static esp_err_t settings_handler(httpd_req_t *req)
     settings_t next = settings;
     bool valid = cJSON_IsObject(json) && update_settings(req->uri, json, &next);
     cJSON_Delete(json);
-    if (!valid || restarting) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid settings");
+    if (!valid) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid settings");
 
+    xSemaphoreTake(settings_write_lock, portMAX_DELAY);
+    if (restarting) {
+        xSemaphoreGive(settings_write_lock);
+        return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Restart pending");
+    }
     esp_err_t err = save_settings(&next);
-    if (err != ESP_OK) return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+    if (err != ESP_OK) {
+        xSemaphoreGive(settings_write_lock);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
+    }
     bool wifi = !strcmp(req->uri, "/api/wifi");
     if (wifi) {
         if (xTaskCreate(restart_task, "wifi_restart", 3072, NULL, 3, NULL) != pdPASS) {
+            xSemaphoreGive(settings_write_lock);
             return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Saved. Restart the device.");
         }
         restarting = true;
@@ -347,6 +415,7 @@ static esp_err_t settings_handler(httpd_req_t *req)
         audio_set_format((audio_format_t){settings.rate, settings.bits, 0});
         update_led();
     }
+    xSemaphoreGive(settings_write_lock);
     return status_handler(req);
 }
 
@@ -378,6 +447,16 @@ void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     load_settings();
+    settings_write_lock = xSemaphoreCreateMutex();
+    ESP_ERROR_CHECK(settings_write_lock ? ESP_OK : ESP_ERR_NO_MEM);
+    const gpio_config_t button = {
+        .pin_bit_mask = 1ULL << BOOT_BUTTON,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&button));
+    ESP_ERROR_CHECK(xTaskCreate(boot_reset_task, "boot_reset", 3072, NULL, 4, NULL) == pdPASS ?
+                    ESP_OK : ESP_ERR_NO_MEM);
     ESP_ERROR_CHECK(esp_read_mac(mac, ESP_MAC_WIFI_STA));
     snprintf(ap_name, sizeof(ap_name), "S3-Audio-%02X%02X%02X", mac[3], mac[4], mac[5]);
     snprintf(device_name, sizeof(device_name), "S3 Audio %02X%02X%02X", mac[3], mac[4], mac[5]);

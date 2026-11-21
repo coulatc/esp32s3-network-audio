@@ -5,7 +5,6 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include <string.h>
-#include "math.h"
 
 static const char *TAG = "audio_buffer";
 
@@ -30,36 +29,26 @@ static struct {
     SemaphoreHandle_t done;   // given by the output task just before it self-deletes
     TaskHandle_t task;
     bool running;   // accessed cross-core; use atomics, never read/write directly
-    uint32_t start_time;
+    atomic_bool playing;
     audio_output_callback_t output_cb;
     void *user_ctx;
     // Optional PCM tap — called ~TAP_LOOKAHEAD_MS before playtime
     audio_pcm_tap_cb_t tap_cb;
     void *tap_user_ctx;
-    float *volume_ptr;
+    const atomic_int *gain_q16;
 } audio_buf = {0};
 
-static struct {
-    uint32_t skip_frames;
-    uint32_t pause_frames;
-} timing_correction = {0, 0};
-
-// Health / diagnostics counters (measurement-driven debugging of the
-// intermittent mid-track glitch). Reset on flush so each track is clean.
 static struct {
     uint32_t frames_played;     // frames actually sent to output_cb
     uint32_t frames_written;    // frames accepted by audio_buffer_write
     uint32_t underruns;         // output task found no ready frame at playtime
     uint32_t dropped_full;      // writes rejected because the ring was full
-    uint32_t skip_total;        // frames dropped by timing correction
-    uint32_t pause_total;       // silence frames inserted by timing correction
 } ab_stats = {0};
 
 // Hot-path scratch buffers kept off the audio_output_task stack. Three
 // 2048-byte branch-local arrays are a stack-overflow risk on the 4096-byte
 // task stack if the compiler does not reuse the array slots. The audio
 // output task is the sole consumer, so file-scope storage is safe.
-static uint8_t g_silence_buf[MAX_FRAME_SIZE];
 static uint8_t g_tap_buf[MAX_FRAME_SIZE];
 static uint8_t g_play_buf[MAX_FRAME_SIZE];
 
@@ -81,35 +70,8 @@ static void audio_output_task(void *arg) {
 
     while (__atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE)) {
         // Wait until we have a start time
-        if (audio_buf.start_time == 0) {
+        if (!atomic_load(&audio_buf.playing)) {
             vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
-        // Handle skip frames
-        if (timing_correction.skip_frames > 0) {
-            uint32_t skipped = 0;
-            xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
-
-            while (timing_correction.skip_frames > 0 && audio_buf.read_idx != audio_buf.write_idx) {
-                audio_buf.frames[audio_buf.read_idx].ready = false;
-                audio_buf.frames[audio_buf.read_idx].tapped = false;
-                audio_buf.read_idx = (audio_buf.read_idx + 1) % BUFFER_FRAMES;
-                timing_correction.skip_frames--;
-                skipped++;
-            }
-
-            xSemaphoreGive(audio_buf.mutex);
-            if (skipped) ab_stats.skip_total += skipped;
-            continue;
-        }
-
-        // Handle pause frames (insert silence)
-        if (timing_correction.pause_frames > 0) {
-            memset(g_silence_buf, 0, 1408); // 352 samples * 4 bytes
-            audio_buf.output_cb(g_silence_buf, 1408, audio_buf.user_ctx);
-            timing_correction.pause_frames--;
-            ab_stats.pause_total++;
             continue;
         }
 
@@ -126,7 +88,7 @@ static void audio_output_task(void *arg) {
                 // This gives the FFT pipeline time to process and send
                 // the UDP packet so visualisation aligns with audio.
                 if (audio_buf.tap_cb && !frame->tapped &&
-                    frame->playtime > 0 && now >= frame->playtime - TAP_LOOKAHEAD_MS) {
+                    frame->playtime > 0 && (int32_t)(frame->playtime - now) <= TAP_LOOKAHEAD_MS) {
                     frame->tapped = true;
                     // Copy data before releasing mutex — tap must not block
                     memcpy(g_tap_buf, frame->data, frame->len);
@@ -144,7 +106,7 @@ static void audio_output_task(void *arg) {
                 }
 
                 // Check if it's time to play this frame
-                if (now < frame->playtime) {
+                if ((int32_t)(now - frame->playtime) < 0) {
                     // Too early, wait
                     xSemaphoreGive(audio_buf.mutex);
                     vTaskDelay(pdMS_TO_TICKS(5));
@@ -154,23 +116,14 @@ static void audio_output_task(void *arg) {
                 memcpy(g_play_buf, frame->data, frame->len);
                 size_t len = frame->len;
 
-                // Apply software volume at read time
-                if (audio_buf.volume_ptr) {
-                    float vol_db = *audio_buf.volume_ptr;
-                    if (vol_db <= -144.0f) {
-                        memset(g_play_buf, 0, len);
-                    } else if (vol_db < 0.0f) {
-                        float linear = powf(10.0f, vol_db / 20.0f);
+                if (audio_buf.gain_q16) {
+                    int gain = atomic_load(audio_buf.gain_q16);
+                    if (gain != 65536) {
                         int16_t *samples = (int16_t *)g_play_buf;
-                        size_t count = len / sizeof(int16_t);
-                        for (size_t i = 0; i < count; i++) {
-                            int32_t scaled = (int32_t)(samples[i] * linear);
-                            if (scaled > 32767) scaled = 32767;
-                            if (scaled < -32768) scaled = -32768;
-                            samples[i] = (int16_t)scaled;
+                        for (size_t i = 0; i < len / sizeof(*samples); i++) {
+                            samples[i] = (int32_t)samples[i] * gain / 65536;
                         }
                     }
-                    // vol_db == 0.0f: full volume, no scaling needed
                 }
 
                 frame->ready = false;
@@ -219,9 +172,9 @@ static void audio_output_task(void *arg) {
                 xSemaphoreGive(audio_buf.mutex);
                 UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
                 ESP_LOGI(TAG, "health: fill=%u/%u played=%u written=%u underruns=%u "
-                            "skipped=%u paused=%u stack_hwm=%uB",
+                            "stack_hwm=%uB",
                          fill, BUFFER_FRAMES, ab_stats.frames_played, ab_stats.frames_written,
-                         ab_stats.underruns, ab_stats.skip_total, ab_stats.pause_total,
+                         ab_stats.underruns,
                          (uint32_t)(hwm * sizeof(StackType_t)));
             }
         }
@@ -237,7 +190,7 @@ static void audio_output_task(void *arg) {
 }
 
 void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
-                       audio_pcm_tap_cb_t tap_cb, float *volume_ptr) {
+                       audio_pcm_tap_cb_t tap_cb, const atomic_int *gain_q16) {
     // If already initialized, just return
     if (audio_buf.frames && audio_buf.mutex) {
         ESP_LOGD(TAG, "Audio buffer already initialized");
@@ -254,7 +207,7 @@ void audio_buffer_init(audio_output_callback_t output_cb, void *user_ctx,
     audio_buf.output_cb = output_cb;
     audio_buf.user_ctx = user_ctx;
     audio_buf.tap_cb = tap_cb;
-    audio_buf.volume_ptr = volume_ptr;
+    audio_buf.gain_q16 = gain_q16;
 
     // Allocate frame buffer in PSRAM
     audio_buf.frames = heap_caps_malloc(BUFFER_FRAMES * sizeof(audio_frame_t),
@@ -317,7 +270,7 @@ void audio_buffer_start(void) {
     __atomic_store_n(&audio_buf.running, true, __ATOMIC_RELEASE);
     audio_buf.read_idx = 0;
     audio_buf.write_idx = 0;
-    audio_buf.start_time = 0;
+    atomic_store(&audio_buf.playing, false);
 
     BaseType_t ok = xTaskCreatePinnedToCore(
         audio_output_task,
@@ -346,7 +299,7 @@ void audio_buffer_set_start_time(uint32_t playtime) {
         return;
     }
 
-    audio_buf.start_time = playtime;
+    atomic_store(&audio_buf.playing, true);
     ESP_LOGD(TAG, "Start time set to %u ms", playtime);
 }
 
@@ -429,6 +382,7 @@ bool audio_buffer_write(const uint8_t *data, size_t len, uint32_t playtime) {
 }
 
 void audio_buffer_flush(void) {
+    atomic_store(&audio_buf.playing, false);
     xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
 
     // Mark all frames as not ready
@@ -444,8 +398,6 @@ void audio_buffer_flush(void) {
 
     // Clear any pending timing correction so a skip/pause burst in flight at
     // flush time does not bleed into the next track (previously never reset).
-    timing_correction.skip_frames = 0;
-    timing_correction.pause_frames = 0;
 
     // Reset per-track diagnostics so each track starts clean. This runs on the
     // RTSP thread while the output task may still increment these counters; on
@@ -490,46 +442,4 @@ void audio_buffer_deinit(void) {
     }
 
     ESP_LOGI(TAG, "Audio buffer deinitialized");
-}
-
-void audio_buffer_get_timing(uint32_t *frames_buffered, uint32_t *head_playtime) {
-
-    if (!audio_buf.frames || !audio_buf.mutex) {
-        *frames_buffered = 0;
-        *head_playtime = 0;
-        return;
-    }
-
-    xSemaphoreTake(audio_buf.mutex, portMAX_DELAY);
-
-    // Calculate how many frames are buffered
-    if (audio_buf.write_idx >= audio_buf.read_idx) {
-        *frames_buffered = audio_buf.write_idx - audio_buf.read_idx;
-    } else {
-        *frames_buffered = BUFFER_FRAMES - audio_buf.read_idx + audio_buf.write_idx;
-    }
-
-    // Get the playtime of the most recent frame
-    if (*frames_buffered > 0) {
-        uint32_t head_idx = (audio_buf.write_idx == 0) ? BUFFER_FRAMES - 1 : audio_buf.write_idx - 1;
-        *head_playtime = audio_buf.frames[head_idx].playtime;
-    } else {
-        *head_playtime = 0;
-    }
-
-    xSemaphoreGive(audio_buf.mutex);
-}
-
-void audio_buffer_skip_frames(uint32_t count) {
-    timing_correction.skip_frames = count;
-    ESP_LOGD(TAG, "Will skip %u frames", count);
-}
-
-void audio_buffer_pause_frames(uint32_t count) {
-    timing_correction.pause_frames = count;
-    ESP_LOGD(TAG, "Will pause %u frames", count);
-}
-
-bool audio_buffer_is_ready(void) {
-    return audio_buf.frames != NULL && __atomic_load_n(&audio_buf.running, __ATOMIC_ACQUIRE);
 }

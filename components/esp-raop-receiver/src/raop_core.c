@@ -1,6 +1,7 @@
 #include "esp_raop_receiver.h"
 #include "raop.h"
 #include "audio_buffer.h"
+#include <math.h>
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
@@ -17,7 +18,8 @@ struct raop_handle_s {
     struct raop_ctx_s *raop_ctx;
     raop_config_t config;
     char device_name[64];
-    float volume;
+    _Atomic float volume;
+    atomic_int gain_q16;
 };
 
 // ---- Internal callback: translates internal events to public API ----
@@ -48,7 +50,7 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
             }
 
             audio_buffer_init(handle->config.audio_output_cb, handle->config.user_ctx,
-                  handle->config.pcm_tap_cb, &handle->volume);
+                  handle->config.pcm_tap_cb, &handle->gain_q16);
 
             if (handle->config.event_cb) {
                 handle->config.event_cb(RAOP_EVENT_CONNECTED, NULL, handle->config.user_ctx);
@@ -93,40 +95,15 @@ static bool internal_cmd_cb(raop_internal_event_t event, ...) {
             }
             break;
 
-        case RAOP_INT_TIMING: {
-            if (!audio_buffer_is_ready()) break;
-
-            uint32_t frames_buffered, head_playtime;
-            audio_buffer_get_timing(&frames_buffered, &head_playtime);
-            if (frames_buffered == 0) break;
-
-            uint32_t now = gettime_ms();
-            uint32_t buffer_duration_ms = (frames_buffered * 352 * 1000) / 44100;
-            uint32_t local_head_time = now + buffer_duration_ms;
-            int32_t error = (int32_t)(head_playtime - local_head_time);
-
-            if (error < -50) {
-                uint32_t skip = (-error * 44100) / (352 * 1000);
-                audio_buffer_skip_frames(skip);
-                ESP_LOGW(TAG, "drift: SKIP %u frames (err=%d ms, buffered=%u, t=%u ms)",
-                         skip, error, frames_buffered, now);
-            } else if (error > 50) {
-                uint32_t pause = (error * 44100) / (352 * 1000);
-                audio_buffer_pause_frames(pause);
-                ESP_LOGW(TAG, "drift: PAUSE %u frames (err=%d ms, buffered=%u, t=%u ms)",
-                         pause, error, frames_buffered, now);
-            }
-            break;
-        }
-
         // ---- Consumer-facing events ----
 
         case RAOP_INT_VOLUME: {
             float volume = (float)va_arg(args, double);
-            handle->volume = volume;
+            atomic_store(&handle->volume, volume);
 
             if (handle->config.volume_mode == RAOP_VOLUME_SOFTWARE) {
-                // Will be applied in audio output path - store for use there
+                int gain = volume <= -144.0f ? 0 : (int)(65536.0f * powf(10.0f, volume / 20.0f));
+                atomic_store(&handle->gain_q16, gain);
             } else if (handle->config.volume_cb) {
                 handle->config.volume_cb(volume, handle->config.user_ctx);
             }
@@ -218,7 +195,8 @@ esp_err_t raop_init(const raop_config_t *config, raop_handle_t **out_handle) {
 
     // Copy config
     memcpy(&handle->config, config, sizeof(raop_config_t));
-    handle->volume = 0.0f;
+    atomic_init(&handle->volume, 0.0f);
+    atomic_init(&handle->gain_q16, 65536);
 
     // Resolve device name
     uint8_t mac[6];
@@ -302,5 +280,5 @@ esp_err_t raop_set_device_name(raop_handle_t *handle, const char *name) {
 
 float raop_get_volume(raop_handle_t *handle) {
     if (!handle) return 0.0f;
-    return handle->volume;
+    return atomic_load(&handle->volume);
 }

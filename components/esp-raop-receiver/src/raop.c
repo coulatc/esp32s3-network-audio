@@ -10,6 +10,8 @@
 #include <stdio.h>
 #include "platform.h"
 #include "mdns.h"
+#include <ctype.h>
+#include <math.h>
 #include "psa/crypto.h"
 #include "mbedtls/base64.h"
 
@@ -60,6 +62,11 @@ typedef struct raop_ctx_s {
 	struct {
 		char *aesiv, *aeskey;
 		char *fmtp;
+        bool announced;
+        bool recording;
+        bool pcm;
+        uint8_t payload_type;
+        float volume_db;
 	} rtsp;
 	struct rtp_s *rtp;
 	raop_cmd_cb_t	cmd_cb;
@@ -119,7 +126,7 @@ struct raop_ctx_s *raop_create(uint32_t host, char *name,
 		{"ek","1"},
 		{"et","0,1"},
 		{"md","0,1,2"},
-		{"cn","1"},
+		{"cn","0,1"},
 		{"ch","2"},
 		{"ss","16"},
 		{"sr","44100"},
@@ -310,7 +317,7 @@ bool raop_cmd(struct raop_ctx_s *ctx, raop_internal_event_t event, void *param) 
 		kd_add(headers, "Active-Remote", ctx->active_remote.id);
 		kd_add(headers, "Connection", "close");
 
-		buf = http_send(sock, method, headers);
+		buf = http_send(sock, method, headers, NULL);
 		len = recv(sock, resp, 512, 0);
 		if (len > 0) resp[len-1] = '\0';
 		LOG_DEBUG("[%p]: sending remote\n%s<== received ==>\n%s", ctx, buf, resp);
@@ -430,12 +437,64 @@ static uint32_t rtsp_decimal(const char *header, const char *key, uint32_t limit
     return end != value && parsed <= limit ? parsed : 0;
 }
 
+static const char *parameter_value(const char *body, const char *name)
+{
+    size_t length = strlen(name);
+    for (const char *line = body; line && *line; ) {
+        if (!strncasecmp(line, name, length) && line[length] == ':') return line + length + 1;
+        line = strchr(line, '\n');
+        if (line) line++;
+    }
+    return NULL;
+}
+
+static bool negotiate_audio(raop_ctx_t *ctx, const char *body)
+{
+    const char *map = parameter_value(body, "a=rtpmap");
+    const char *fmtp = parameter_value(body, "a=fmtp");
+    unsigned long payload = 96;
+    if (map) {
+        char *encoding;
+        payload = strtoul(map, &encoding, 10);
+        if (encoding == map || !isspace((unsigned char)*encoding) ||
+            payload < 96 || payload > 127) return false;
+        while (*encoding == ' ' || *encoding == '\t') encoding++;
+        size_t size = strcspn(encoding, "\r\n \t");
+        ctx->rtsp.pcm = size == sizeof("L16/44100/2") - 1 &&
+                        !strncasecmp(encoding, "L16/44100/2", size);
+        if (!ctx->rtsp.pcm && (size != sizeof("AppleLossless") - 1 ||
+                              strncasecmp(encoding, "AppleLossless", size))) return false;
+    }
+    if (!ctx->rtsp.pcm) {
+        if (!fmtp) return false;
+        char *end;
+        if (strtoul(fmtp, &end, 10) != payload || end == fmtp) return false;
+        ctx->rtsp.fmtp = strndup(fmtp, strcspn(fmtp, "\r\n"));
+        if (!ctx->rtsp.fmtp) return false;
+    }
+    ctx->rtsp.payload_type = payload;
+    ctx->rtsp.announced = true;
+    LOG_INFO("RAOP format: %s, RTP payload %u", ctx->rtsp.pcm ? "L16/44100/2" : "ALAC", (unsigned)payload);
+    return true;
+}
+
+static int rtsp_sequence(const char *header)
+{
+    const char *seq = header ? strcasestr(header, "seq=") : NULL;
+    if (!seq || !isdigit((unsigned char)seq[4])) return -1;
+    char *end;
+    unsigned long value = strtoul(seq + 4, &end, 10);
+    return value <= UINT16_MAX && (*end == 0 || *end == ';' || isspace((unsigned char)*end)) ?
+        (int)value : -1;
+}
+
 static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 {
 	char *buf = NULL, *body = NULL, method[16] = "";
 	key_data_t headers[32], resp[16] = { {NULL, NULL} };
 	int len;
 	bool success = true;
+    char reply_body[48] = {0};
 
 	LOG_DEBUG("[%p]: received %s", ctx, method);
 
@@ -507,12 +566,12 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
             goto respond;
         }
 
-        p = strcasestr(body, "fmtp");
-        if (p) ctx->rtsp.fmtp = strextract(p, ":", "\r\n");
-        if (!ctx->rtsp.fmtp) {
+        if (!negotiate_audio(ctx, body)) {
+            LOG_WARN("Unsupported RAOP SDP audio format");
             success = false;
             goto respond;
         }
+        ctx->cmd_cb(RAOP_INT_VOLUME, 0.0);
         buf = kd_lookup(headers, "DACP-ID");
         if (buf) strlcpy(ctx->active_remote.DACPid, buf, sizeof(ctx->active_remote.DACPid));
         buf = kd_lookup(headers, "Active-Remote");
@@ -548,7 +607,7 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 			ctx->active_remote.thread = NULL;
 		}
 
-	} else if (!strcmp(method, "SETUP") && !ctx->rtp && ctx->rtsp.fmtp &&
+	} else if (!strcmp(method, "SETUP") && !ctx->rtp && ctx->rtsp.announced &&
 	           ((buf = kd_lookup(headers, "Transport")) != NULL)) {
 		rtp_resp_t rtp = { 0 };
 		short unsigned tport = 0, cport = 0;
@@ -561,7 +620,7 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
         cport = rtsp_decimal(buf, "control_port=", UINT16_MAX);
 
 		rtp = rtp_init(ctx->peer, ctx->latency, ctx->rtsp.aeskey, ctx->rtsp.aesiv,
-					   ctx->rtsp.fmtp, cport, tport, buffer, size, ctx->cmd_cb, ctx->data_cb);
+					   ctx->rtsp.fmtp, ctx->rtsp.pcm, ctx->rtsp.payload_type, cport, tport, buffer, size, ctx->cmd_cb, ctx->data_cb);
 
 		ctx->rtp = rtp.ctx;
 
@@ -582,7 +641,7 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		}
 
 	} else if (!strcmp(method, "RECORD")) {
-		unsigned short seqno = 0;
+		int seqno;
 		unsigned rtptime = 0;
 
 		if (ctx->latency) {
@@ -592,19 +651,25 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		}
 
 		buf = kd_lookup(headers, "RTP-Info");
-        seqno = rtsp_decimal(buf, "seq=", UINT16_MAX);
+        seqno = rtsp_sequence(buf);
         rtptime = rtsp_decimal(buf, "rtptime=", UINT32_MAX);
 
-		if (ctx->rtp) rtp_record(ctx->rtp, seqno, rtptime);
-
-		success = ctx->cmd_cb(RAOP_INT_STREAM);
+        if (!ctx->rtp) {
+            success = false;
+            goto respond;
+        }
+        success = ctx->cmd_cb(ctx->rtsp.recording ? RAOP_INT_FLUSH : RAOP_INT_STREAM);
+        if (success) {
+            rtp_record(ctx->rtp, seqno, rtptime);
+            ctx->rtsp.recording = true;
+        }
 
 	}  else if (!strcmp(method, "FLUSH")) {
-		unsigned short seqno = 0;
+		int seqno;
 		unsigned rtptime = 0;
 
 		buf = kd_lookup(headers, "RTP-Info");
-        seqno = rtsp_decimal(buf, "seq=", UINT16_MAX);
+        seqno = rtsp_sequence(buf);
         rtptime = rtsp_decimal(buf, "rtptime=", UINT32_MAX);
 
 		if (ctx->rtp && rtp_flush(ctx->rtp, seqno, rtptime, true)) {
@@ -617,15 +682,28 @@ static bool handle_rtsp(raop_ctx_t *ctx, int sock)
 		cleanup_rtsp(ctx, false);
 		success = ctx->cmd_cb(RAOP_INT_STOP);
 
-	} else if (!strcmp(method, "SET_PARAMETER")) {
-		char *p;
-
-		if (body && (p = strcasestr(body, "volume")) != NULL) {
-			float volume = -144.0f;
-
-			sscanf(p, "%*[^:]:%f", &volume);
-			success = ctx->cmd_cb(RAOP_INT_VOLUME, volume);
-		} else if (body && (p = strcasestr(body, "progress")) != NULL) {
+    } else if (!strcmp(method, "GET_PARAMETER")) {
+        if (body && !strncasecmp(body, "volume", sizeof("volume") - 1)) {
+            snprintf(reply_body, sizeof(reply_body), "volume: %.6f\r\n", (double)ctx->rtsp.volume_db);
+            char length[8];
+            snprintf(length, sizeof(length), "%u", (unsigned)strlen(reply_body));
+            kd_add(resp, "Content-Type", "text/parameters");
+            kd_add(resp, "Content-Length", length);
+        }
+    } else if (!strcmp(method, "SET_PARAMETER")) {
+        char *p;
+        const char *type = kd_lookup(headers, "Content-Type");
+        bool text = !type || !strncasecmp(type, "text/parameters", sizeof("text/parameters") - 1);
+        const char *value = text ? parameter_value(body, "volume") : NULL;
+        if (value) {
+            char *end;
+            const float volume = strtof(value, &end);
+            if (end != value && isfinite(volume) && volume >= -144.0f && volume <= 0.0f &&
+                (*end == '\r' || *end == '\n' || *end == '\0' || *end == ' ' || *end == '\t')) {
+                ctx->rtsp.volume_db = volume;
+                success = ctx->cmd_cb(RAOP_INT_VOLUME, (double)volume);
+            }
+		} else if (body && text && (p = strcasestr(body, "progress")) != NULL) {
 			unsigned start = 0, current = 0, stop = 0;
 
 			sscanf(p, "%*[^:]:%u/%u/%u", &start, &current, &stop);
@@ -673,9 +751,9 @@ respond:
 	}
 
 	if (success) {
-		buf = http_send(sock, "RTSP/1.0 200 OK", resp);
+		buf = http_send(sock, "RTSP/1.0 200 OK", resp, reply_body);
 	} else {
-		buf = http_send(sock, "RTSP/1.0 503 Service Unavailable", resp);
+		buf = http_send(sock, "RTSP/1.0 503 Service Unavailable", resp, NULL);
 	}
 
 	if (body) free(body);
@@ -723,6 +801,10 @@ void cleanup_rtsp(raop_ctx_t *ctx, bool abort) {
 	ctx->rtsp.aeskey = NULL;
 	ctx->rtsp.aesiv = NULL;
 	ctx->rtsp.fmtp = NULL;
+    ctx->rtsp.announced = false;
+    ctx->rtsp.recording = false;
+    ctx->rtsp.pcm = false;
+    ctx->rtsp.volume_db = 0.0f;
 }
 
 /*----------------------------------------------------------------------------*/

@@ -7,7 +7,7 @@
 1. DAC 接开发板的原生 USB OTG 口，烧录和串口日志用独立的 UART/USB 转串口连接。OTG 接口需要能在主机模式下给 DAC 提供 5 V VBUS。
 2. 连接热点 `S3-Audio-XXXXXX`，密码 `S3audio-setup`，在浏览器打开 `http://192.168.4.1/`。名称中的 XXXXXX 来自本板 Wi-Fi MAC 的末六位。
 3. 在网页保存家里或工作室的 **2.4 GHz Wi-Fi**。板子重启，连上 Wi-Fi 并取得 IP 后会关闭配置热点。把手机或电脑接入同一局域网，访问串口日志显示的 `http://<设备IP>/`，或尝试 `http://s3-audio-xxxxxx.local/`。连不上已保存的 Wi-Fi 时，板子会继续开放配置热点。
-4. 在苹果设备的音频输出列表，或 DLNA 播放器的渲染器列表中，选择 `S3 Audio XXXXXX`。
+4. 在 iPhone 或 iPad 的控制中心，从正在播放的音频输出列表选择 `S3 Audio XXXXXX`。播放视频时，画面仍在手机或平板上显示。DLNA 播放器也可从渲染器列表选择同一设备。
 
 ## 后台
 
@@ -15,9 +15,13 @@
 - **GPIO48 WS2812**按一颗 GRB LED 配置。可选关闭、常亮或设备状态，并调整颜色和亮度。状态模式下橙色闪烁代表配置热点，红色代表等待 DAC，绿色代表正在播放，其余时间使用自选颜色。
 - Wi-Fi、偏好的输出格式和灯光设置保存在 NVS 中。网页仅需本地局域网。若要通过本地 API 恢复配置热点，可向 `/api/wifi` 提交 `{"ssid":"","password":""}`，设备会重启。
 
+## BOOT 恢复配置
+
+设备启动后长按 BOOT（GPIO0）至少 5 秒，松手后自动重启。Wi-Fi、USB 输出格式和灯光恢复默认值，随后可连接设备的配置热点重新设置。
+
 ## 协议与输出范围
 
-- AirPlay 1 音频通过 RAOP 接收 44.1 kHz / 16 bit 双声道 ALAC，支持 RSA 挑战和加密 RTP。工程的 AirPlay 路径需要至少 2 MB 可用 PSRAM。此工程的 AirPlay 功能范围为单设备音频投放。
+- AirPlay 1 音频通过 RAOP 接收 44.1 kHz / 16 bit 双声道 ALAC 和 L16 PCM，支持 RSA 挑战和加密 RTP。工程的 AirPlay 路径需要至少 2 MB 可用 PSRAM。此工程的 AirPlay 功能范围为单设备音频投放。
 - DLNA 实现了 SSDP 发现、UPnP MediaRenderer 描述及 AVTransport、RenderingControl、ConnectionManager 控制。接收播放地址，由板子通过 HTTP/HTTPS 读取 MP3、WAV 或原生 FLAC，提供播放、暂停、停止、音量和静音。要切换曲目，由控制端提交下一个 URI。
 - DAC 输出是双声道 PCM，通过 UAC1 或 UAC2。不同 CX31993 成品的 USB 描述符可能不同，能启用的格式以设备后台实际显示为准。输入和输出采样率不同时使用线性重采样。位深选项控制 USB 输出的数据格式。
 
@@ -33,7 +37,7 @@ idf.py -p COM7 flash
 idf.py -p COM7 monitor
 ```
 
-安装路径匹配时也可执行 `./build-local.ps1 -Action build` 或 `./build-local.ps1 -Action flash -Port COM7`。脚本可用 -Profile 指定 ESP-IDF v6.1 PowerShell 环境。将示例中的 COM7 换成开发板的串口。依赖版本在 `dependencies.lock` 固定。首次构建需要访问 ESP Component Registry。工程内包含 RAOP、ALAC、WAV、FLAC 和 MP3 解码所需的源文件。
+安装路径匹配时也可执行 `./build-local.ps1 -Action build` 或 `./build-local.ps1 -Action flash -Port COM7`。脚本可用 -Profile 指定 ESP-IDF v6.1 PowerShell 环境。将示例中的 COM7 换成开发板的串口。依赖版本在 `dependencies.lock` 固定。应用默认使用 ESP-IDF 的 Optimize for performance（GCC -O2）。首次构建需要访问 ESP Component Registry。工程内包含 RAOP、ALAC、WAV、FLAC 和 MP3 解码所需的源文件。
 
 `firmware/` 内包含同一次构建的三个镜像，可从该目录使用本机 ESP-IDF 环境直接烧录：
 
@@ -41,9 +45,9 @@ idf.py -p COM7 monitor
 python -m esptool --chip esp32s3 -p COM7 -b 460800 write-flash --flash-mode dio --flash-size 16MB --flash-freq 80m 0x0 bootloader.bin 0x8000 partition-table.bin 0x10000 s3_network_audio.bin
 ```
 
-## 首版验证
+## 验证
 
-在 ESP32-S3 上通过 CX31993+MAX97220 PRO 验证了 DLNA 的 WAV、MP3、FLAC，以及 AirPlay 1 加密 ALAC 测试流的 USB 输出。网页设置已测试，包括 GPIO48 WS2812 和 48 kHz / 24 bit 切换。苹果真机的投放以及实际路由器下的 DHCP 和局域网 IP 访问待验证。
+在 ESP32-S3 上通过 CX31993+MAX97220 PRO 验证了 DLNA 的 WAV、MP3、FLAC，以及 AirPlay 1 加密 ALAC 和 L16 PCM 测试流的 USB 输出。L16 测试覆盖省略起播序号及连续片段切换。网页设置已测试，包括 GPIO48 WS2812 和 48 kHz / 24 bit 切换。使用隔离配置验证了 BOOT 短按保持设置和长按松手恢复默认。iOS 真机视频投放需要在所用的 App 中验证。
 
 ## 上游组件
 

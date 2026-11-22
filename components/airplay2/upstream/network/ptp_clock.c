@@ -44,6 +44,7 @@ enum {
   PTP_FALLBACK_PRIORITY = 249,
   PTP_ANNOUNCE_DATASET_SIZE = 64,
   PTP_SYNC_PERIOD_US = 125000,
+  PTP_DELAY_REQ_PERIOD_US = 250000,
   PTP_ANNOUNCE_PERIOD_US = 1000000,
   PTP_UNICAST = 0x04,
   PTP_TWO_STEP = 0x02,
@@ -56,6 +57,7 @@ typedef struct {
   uint8_t profile;
   uint8_t domain;
   bool serving;
+  bool following;
 } ptp_peer_t;
 
 static uint64_t local_clock_id;
@@ -491,7 +493,7 @@ static void process_ptp_message(const uint8_t *data, size_t len,
   portENTER_CRITICAL(&ptp_state_mux);
   // If a master filter is set, reject messages from other clocks.
   // This applies only to messages that contribute to offset estimation
-  // (SYNC / FOLLOW_UP); ANNOUNCE and others are ignored anyway.
+  // (SYNC / FOLLOW_UP).
   if (ptp.expected_clock_id != 0 &&
       (msg_type == PTP_MSG_SYNC || msg_type == PTP_MSG_FOLLOW_UP)) {
     uint64_t src_clock_id = parse_ptp_clock_id(data);
@@ -527,6 +529,7 @@ static void process_ptp_message(const uint8_t *data, size_t len,
         clear_clock_state();
       }
       timing_peer.serving = yields;
+      timing_peer.following = !yields;
       timing_peer.profile = data[0] & 0xF0;
       timing_peer.domain = data[4];
     }
@@ -613,6 +616,13 @@ static void send_sync(const ptp_peer_t *peer, uint16_t seq) {
   send_unicast(ptp.general_socket, PTP_GENERAL_PORT, peer, followup, sizeof(followup));
 }
 
+static void send_delay_request(const ptp_peer_t *peer, uint16_t seq) {
+  uint8_t request[PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE];
+  put_header(request, sizeof(request), peer, PTP_MSG_DELAY_REQ, seq, false, 1, -2);
+  put_timestamp(request + PTP_HEADER_SIZE, get_local_time_ns());
+  send_unicast(ptp.event_socket, PTP_EVENT_PORT, peer, request, sizeof(request));
+}
+
 static void respond_to_delay(const uint8_t *request, size_t len, uint32_t sender,
                              uint64_t received_ns) {
   if (len < PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE || (request[1] & 0x0F) != 2) return;
@@ -694,8 +704,8 @@ static void receive_ptp(int sock, uint8_t *buffer, size_t capacity, bool event) 
 
 static void ptp_task(void *pvParameters) {
   uint8_t buffer[256];
-  uint16_t sync_seq = 0, announce_seq = 0;
-  int64_t next_sync = 0, next_announce = 0;
+  uint16_t sync_seq = 0, announce_seq = 0, delay_seq = 0;
+  int64_t next_sync = 0, next_announce = 0, next_delay = 0;
   const void *serving_session = NULL;
 
   while (ptp.running) {
@@ -722,12 +732,12 @@ static void ptp_task(void *pvParameters) {
     }
 
     ptp_peer_t peer = snapshot_peer();
+    int64_t now = esp_timer_get_time();
     if (peer.serving) {
       if (serving_session != peer.session) {
         serving_session = peer.session;
         next_sync = next_announce = 0;
       }
-      int64_t now = esp_timer_get_time();
       if (now >= next_announce) {
         send_announce(&peer, ++announce_seq);
         next_announce = now + PTP_ANNOUNCE_PERIOD_US;
@@ -739,8 +749,18 @@ static void ptp_task(void *pvParameters) {
     } else {
       serving_session = NULL;
     }
-    struct timeval tv = peer.serving ? (struct timeval){.tv_usec = PTP_SYNC_PERIOD_US} :
-                                      (struct timeval){.tv_sec = 1};
+
+    // Sender clocks such as AirFlash wait for a delay exchange before streaming.
+    if (!peer.following) {
+      next_delay = 0;
+    } else if (now >= next_delay) {
+      send_delay_request(&peer, ++delay_seq);
+      next_delay = now + PTP_DELAY_REQ_PERIOD_US;
+    }
+
+    struct timeval tv = {.tv_sec = 1};
+    if (peer.serving) tv = (struct timeval){.tv_usec = PTP_SYNC_PERIOD_US};
+    if (peer.following) tv = (struct timeval){.tv_usec = PTP_DELAY_REQ_PERIOD_US};
     int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
 
     if (ret < 0) {

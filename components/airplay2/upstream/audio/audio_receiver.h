@@ -171,8 +171,10 @@ void audio_receiver_pause(void);
  * Set the stream playout latency in samples, added to every frame's
  * anchor-scheduled play time.  Realtime streams (type 96): latencyMin from
  * SETUP (default 11025 = 250 ms).  Buffered streams (type 103): 0.
+ * A zero preroll limit selects the engine's default startup buffer.
  */
-void audio_receiver_set_playout_latency_samples(uint32_t latency_samples);
+void audio_receiver_set_playout_latency_samples(uint32_t latency_samples,
+                                                uint32_t preroll_limit_samples);
 
 /**
  * Set advertised/target output latency in microseconds.

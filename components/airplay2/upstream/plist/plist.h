@@ -272,7 +272,8 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
 size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  int64_t stream_type, uint16_t data_port,
                                  uint16_t control_port,
-                                 uint32_t audio_buffer_size);
+                                 uint32_t audio_buffer_size,
+                                 uint32_t latency_min_samples);
 
 /**
  * Build feedback response bplist

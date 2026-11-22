@@ -22,6 +22,10 @@ static const char *TAG = "audio_v2";
 #define START_STALL_AFTER_US  3000000LL
 #define START_STALL_REPEAT_US 10000000LL
 
+static uint32_t default_preroll_samples(int sample_rate) {
+  return (uint32_t)((uint64_t)sample_rate * 180U / 1000U);
+}
+
 esp_err_t audio_engine_v2_init(audio_engine_v2_t *engine,
                                const audio_format_t *format,
                                uint32_t frame_samples, uint16_t capacity) {
@@ -41,8 +45,7 @@ esp_err_t audio_engine_v2_init(audio_engine_v2_t *engine,
   }
 
   engine->format = *format;
-  uint32_t preroll_samples =
-      (uint32_t)((uint64_t)format->sample_rate * 180U / 1000U);
+  uint32_t preroll_samples = default_preroll_samples(format->sample_rate);
   audio_scheduler_init(&engine->scheduler, preroll_samples, 1000000LL);
   engine->playing = false;
   engine->initialized = true;
@@ -115,8 +118,17 @@ void audio_engine_v2_set_format(audio_engine_v2_t *engine,
     return;
   }
   engine->format = *format;
-  engine->scheduler.preroll_samples =
-      (uint32_t)((uint64_t)format->sample_rate * 180U / 1000U);
+  audio_engine_v2_set_preroll_limit(engine, 0);
+}
+
+void audio_engine_v2_set_preroll_limit(audio_engine_v2_t *engine,
+                                      uint32_t max_samples) {
+  uint32_t preroll_samples = default_preroll_samples(engine->format.sample_rate);
+  if (max_samples > 0 && max_samples < preroll_samples) {
+    preroll_samples = max_samples;
+  }
+  __atomic_store_n(&engine->scheduler.preroll_samples, preroll_samples,
+                   __ATOMIC_RELAXED);
 }
 
 bool audio_engine_v2_set_frame_samples(audio_engine_v2_t *engine,
@@ -175,7 +187,8 @@ static void start_watchdog_check(audio_engine_v2_t *engine, int64_t now_us) {
            diag.has_newest ? "" : "n/a:", diag.newest_end_rtp,
            diag.target_covered ? 1 : 0,
            diag.has_next ? "" : "n/a:", diag.next_rtp, diag.contiguous_samples,
-           engine->scheduler.preroll_samples, engine->scheduler.start_attempts,
+           __atomic_load_n(&engine->scheduler.preroll_samples, __ATOMIC_RELAXED),
+           engine->scheduler.start_attempts,
            engine->scheduler.fallback_attempts,
            engine->scheduler.silent_render_calls, engine->blocks_inserted,
            engine->blocks_rejected);

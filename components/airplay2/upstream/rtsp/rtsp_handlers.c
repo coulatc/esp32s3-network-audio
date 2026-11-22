@@ -32,6 +32,7 @@
 #include "plist.h"
 #include "rtsp_fairplay.h"
 #include "rtsp_rsa.h"
+#include "rtsp_server.h"
 #include "settings.h"
 #include "socket_utils.h"
 #include "tlv8.h"
@@ -94,11 +95,9 @@ bool rtsp_codec_configure(int64_t type_id, audio_format_t *fmt,
 // standard AirPlay realtime-stream minimum latency; senders transmit audio
 // ~2 s (88200 samples) ahead of this deadline.
 #define AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES 11025
-static int event_client_socket = -1;
-static int event_listen_socket = -1;
-static TaskHandle_t event_task_handle = NULL;
-static volatile bool event_task_should_stop = false;
-
+// Early-RECORD senders can pace packets too close to the playout deadline
+// for this receiver to fill its realtime startup buffer.
+#define AIRPLAY_EARLY_RECORD_MIN_LATENCY_MS 50
 void rtsp_get_device_id(char *device_id, size_t len) {
   uint8_t mac[6];
   esp_read_mac(mac, ESP_MAC_WIFI_STA);
@@ -196,148 +195,54 @@ static bool start_audio_receiver_or_fail(int socket, rtsp_conn_t *conn,
   return true;
 }
 
-// Event port task - handles AirPlay 2 session persistence
-static void event_port_task(void *pvParameters) {
-  int listen_socket = (int)(intptr_t)pvParameters;
-  event_listen_socket = listen_socket;
+// Each AirPlay 2 control connection owns its own event channel. Opening a
+// provisional event port must never close the audio session's event socket.
+static int wait_for_event_socket(int socket) {
+  fd_set reads;
+  FD_ZERO(&reads);
+  FD_SET(socket, &reads);
+  struct timeval wait = {.tv_usec = 250000};
+  return select(socket + 1, &reads, NULL, NULL, &wait);
+}
 
-  while (!event_task_should_stop && listen_socket >= 0) {
-    fd_set read_fds;
-    FD_ZERO(&read_fds);
-    FD_SET(listen_socket, &read_fds);
-
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-    int ret = select(listen_socket + 1, &read_fds, NULL, NULL, &tv);
-
-    if (event_task_should_stop) {
-      break;
+static void event_port_task(void *arg) {
+  rtsp_conn_t *conn = arg;
+  int listener = conn->event_socket;
+  while (!atomic_load(&conn->event_stop)) {
+    int ready = wait_for_event_socket(listener);
+    if (ready < 0) break;
+    if (ready == 0 || atomic_load(&conn->event_stop)) continue;
+    int client = accept(listener, NULL, NULL);
+    if (client < 0) break;
+    ESP_LOGI(TAG, "Event client connected on port %u", conn->event_port);
+    while (!atomic_load(&conn->event_stop)) {
+      ready = wait_for_event_socket(client);
+      if (ready < 0) break;
+      if (ready == 0 || atomic_load(&conn->event_stop)) continue;
+      uint8_t buffer[128];
+      ssize_t n = recv(client, buffer, sizeof(buffer), MSG_DONTWAIT);
+      if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) break;
     }
-
-    if (ret < 0) {
-      if (errno != EINTR && !event_task_should_stop) {
-        ESP_LOGE(TAG, "Event port select error: %d", errno);
-      }
-      break;
-    }
-
-    if (ret == 0) {
-      continue;
-    }
-
-    // Check stop flag after select unblocks (shutdown() makes socket readable)
-    if (event_task_should_stop) {
-      break;
-    }
-
-    if (FD_ISSET(listen_socket, &read_fds)) {
-      struct sockaddr_in client_addr;
-      socklen_t addr_len = sizeof(client_addr);
-      int client =
-          accept(listen_socket, (struct sockaddr *)&client_addr, &addr_len);
-      if (client < 0) {
-        if (!event_task_should_stop) {
-          ESP_LOGE(TAG, "Event port accept error: %d", errno);
-        }
-        break; // Don't continue - socket is likely invalid
-      }
-
-      if (event_client_socket >= 0) {
-        close(event_client_socket);
-      }
-      event_client_socket = client;
-      ESP_LOGI(TAG, "Event client connected");
-      playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_CONNECTED,
-                           NULL);
-
-      // Monitor connection for disconnection
-      while (event_client_socket >= 0 && !event_task_should_stop) {
-        fd_set cfds;
-        FD_ZERO(&cfds);
-        FD_SET(event_client_socket, &cfds);
-        struct timeval ctv = {.tv_sec = 1, .tv_usec = 0};
-
-        ret = select(event_client_socket + 1, &cfds, NULL, NULL, &ctv);
-        if (ret < 0) {
-          break;
-        }
-        // Check stop flag after select unblocks
-        if (event_task_should_stop) {
-          break;
-        }
-        if (ret > 0 && FD_ISSET(event_client_socket, &cfds)) {
-          char buf[16];
-          ssize_t n = recv(event_client_socket, buf, sizeof(buf), MSG_PEEK);
-          if (n <= 0) {
-            close(event_client_socket);
-            event_client_socket = -1;
-            break;
-          }
-        }
-      }
-    }
+    close(client);
   }
-
-  if (event_client_socket >= 0) {
-    close(event_client_socket);
-    event_client_socket = -1;
-  }
-  event_listen_socket = -1;
-  event_task_handle = NULL;
+  atomic_store(&conn->event_running, false);
   vTaskDelete(NULL);
 }
 
-static bool event_port_wait_for_task_stopped(int timeout_ticks) {
-  while (event_task_handle != NULL && timeout_ticks-- > 0) {
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-  return event_task_handle == NULL;
-}
-
-esp_err_t rtsp_start_event_port_task(int listen_socket) {
-  if (event_task_handle != NULL) {
-    rtsp_stop_event_port_task();
-    if (!event_port_wait_for_task_stopped(20)) {
-      ESP_LOGE(TAG, "Previous event port task did not stop");
-      return ESP_ERR_INVALID_STATE;
-    }
-  }
-  event_task_should_stop = false;
-  event_listen_socket = -1;
-  event_task_handle = NULL;
-  BaseType_t ret =
-      xTaskCreate(event_port_task, "event_port", EVENT_STACK_SIZE,
-                  (void *)(intptr_t)listen_socket, 5, &event_task_handle);
-  if (ret != pdPASS) {
-    event_task_handle = NULL;
-    ESP_LOGE(TAG, "Failed to create event port task");
-    return ESP_FAIL;
+static esp_err_t start_event_port_task(rtsp_conn_t *conn) {
+  atomic_store(&conn->event_stop, false);
+  atomic_store(&conn->event_running, true);
+  if (xTaskCreate(event_port_task, "event_port", EVENT_STACK_SIZE, conn, 5,
+                  NULL) != pdPASS) {
+    atomic_store(&conn->event_running, false);
+    return ESP_ERR_NO_MEM;
   }
   return ESP_OK;
 }
 
-int rtsp_event_port_listen_socket(void) {
-  return event_listen_socket;
-}
-
-void rtsp_stop_event_port_task(void) {
-  if (event_task_handle == NULL) {
-    return;
-  }
-
-  // Signal task to stop
-  event_task_should_stop = true;
-
-  // Shutdown sockets to unblock select()
-  if (event_client_socket >= 0) {
-    shutdown(event_client_socket, SHUT_RDWR);
-  }
-  if (event_listen_socket >= 0) {
-    shutdown(event_listen_socket, SHUT_RDWR);
-  }
-
-  if (!event_port_wait_for_task_stopped(20)) {
-    ESP_LOGW(TAG, "Event port task did not exit within timeout");
-  }
+void rtsp_stop_event_port_task(rtsp_conn_t *conn) {
+  atomic_store(&conn->event_stop, true);
+  while (atomic_load(&conn->event_running)) vTaskDelay(pdMS_TO_TICKS(20));
 }
 
 // Forward declarations of handlers
@@ -485,14 +390,35 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
                req.method);
     }
   }
-  // Update DACP client session when both identifiers are available
-  if (conn->dacp_id[0] != '\0' && conn->active_remote[0] != '\0') {
+  // Auxiliary connections can carry DACP headers without owning playback.
+  if (rtsp_playback_is_owner(conn) && conn->dacp_id[0] != '\0' && conn->active_remote[0] != '\0') {
     dacp_set_session(conn->dacp_id, conn->active_remote, conn->client_ip);
   }
 
   // Find handler in dispatch table
   for (const rtsp_method_handler_t *h = method_handlers; h->method; h++) {
     if (strcasecmp(req.method, h->method) == 0) {
+      if (!rtsp_playback_is_owner(conn)) {
+        // AirFlash sends RECORD between the two AirPlay 2 SETUP requests.
+        // The stream SETUP will claim playback once it specifies an audio stream.
+        if (h->handler == handle_record && conn->encrypted_mode &&
+            conn->initial_audio_setup_complete) {
+          conn->early_record_received = true;
+          rtsp_send_ok(socket, conn, req.cseq);
+          return 0;
+        }
+        if (h->handler == handle_teardown) {
+          rtsp_send_ok(socket, conn, req.cseq);
+          return 0;
+        }
+        if (h->handler == handle_record || h->handler == handle_pause ||
+            h->handler == handle_flush || h->handler == handle_flushbuffered ||
+            h->handler == handle_setrateanchortime) {
+          rtsp_send_response(socket, conn, 455, "Method Not Valid in This State",
+                             req.cseq, NULL, NULL, 0);
+          return 0;
+        }
+      }
       h->handler(socket, conn, &req, raw_request, raw_len);
       return 0;
     }
@@ -1046,7 +972,8 @@ static void handle_announce(int socket, rtsp_conn_t *conn,
   (void)raw;
   (void)raw_len;
 
-  if (req->body && req->body_len > 0) {
+  if (req->body && req->body_len > 0 &&
+      strstr((const char *)req->body, "m=audio ") && rtsp_playback_claim(conn)) {
     parse_sdp(conn, (const char *)req->body, req->body_len);
   }
 
@@ -1067,8 +994,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   // Check for streams array
   bool request_has_streams = false;
   size_t stream_count = 0;
+  uint32_t stream_sample_rate = 44100;
   if (body && body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
-    if (bplist_get_streams_count(body, body_len, &stream_count)) {
+    if (bplist_get_streams_count(body, body_len, &stream_count) && stream_count > 0) {
       request_has_streams = true;
     }
   }
@@ -1082,7 +1010,26 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       !request_has_streams &&
       parse_raw_header(raw, raw_len, "Transport:") != NULL;
 
-  if (body && body_len > 0 && is_bplist && request_has_streams) {
+  if (request_has_streams) {
+    int64_t type = 0;
+    size_t key, iv, shared;
+    if (!is_bplist || !bplist_get_stream_info(body, body_len, 0, &type, &key, &iv, &shared) ||
+        (type != AUDIO_STREAM_REALTIME && type != AUDIO_STREAM_BUFFERED)) {
+      rtsp_send_response(socket, conn, 461, "Unsupported Transport", req->cseq,
+                         NULL, NULL, 0);
+      return;
+    }
+  }
+  if ((request_has_streams || is_v1_transport_setup) && !rtsp_playback_claim(conn)) {
+    rtsp_send_response(socket, conn, 455, "Method Not Valid in This State",
+                       req->cseq, NULL, NULL, 0);
+    return;
+  }
+
+  if (request_has_streams) {
+    conn->initial_audio_setup_complete = false;
+    if (conn->ptp_requested) ptp_clock_set_peer(conn, conn->client_ip);
+    if (!start_ntp_timing_or_fail(socket, conn, req)) return;
     conn->protocol_version = 2;
     for (size_t i = 0; i < stream_count; i++) {
       int64_t stream_type = -1;
@@ -1120,13 +1067,16 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
           rtsp_codec_configure(codec_type, &format, sample_rate,
                                samples_per_frame);
           audio_receiver_set_format(&format);
+          if (i == 0 && format.sample_rate > 0) {
+            stream_sample_rate = (uint32_t)format.sample_rate;
+          }
         }
       }
     }
   }
 
-  // Process encryption keys
-  if (body && body_len > 0) {
+  // Apply encryption only to the connection that owns the audio stream.
+  if (request_has_streams) {
     uint8_t ekey_encrypted[64];
     size_t ekey_len = 0;
     uint8_t eiv[16];
@@ -1206,21 +1156,18 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     }
   }
 
-  // Create event port if needed
-  if (!is_v1_transport_setup && conn->event_port == 0) {
+  // Event-only setup remains provisional until the connection asks for audio.
+  if (!is_v1_transport_setup && is_bplist && conn->event_port == 0) {
     conn->event_socket = rtsp_create_event_socket(&conn->event_port);
-    if (conn->event_socket >= 0) {
-      if (rtsp_start_event_port_task(conn->event_socket) == ESP_OK) {
-        ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
-      } else {
-        close(conn->event_socket);
-        conn->event_socket = -1;
-        conn->event_port = 0;
-        rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
-                           NULL, 0);
-        return;
-      }
+    if (conn->event_socket < 0 || start_event_port_task(conn) != ESP_OK) {
+      if (conn->event_socket >= 0) close(conn->event_socket);
+      conn->event_socket = -1;
+      conn->event_port = 0;
+      rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,
+                         NULL, 0);
+      return;
     }
+    ESP_LOGI(TAG, "SETUP: Created event port %u", conn->event_port);
   }
 
   // Handle initial SETUP vs stream SETUP
@@ -1276,18 +1223,18 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
       int64_t timing_port;
       bool has_timing = bplist_find_string(body, body_len, "timingProtocol", timing_protocol,
                                           sizeof(timing_protocol));
-      if (has_timing && strcmp(timing_protocol, "PTP") == 0 && conn->encrypted_mode) {
+      bool uses_ptp = has_timing && strcmp(timing_protocol, "PTP") == 0 &&
+                      conn->encrypted_mode;
+      bool uses_ntp = has_timing && strcmp(timing_protocol, "NTP") == 0 &&
+                      bplist_find_int(body, body_len, "timingPort", &timing_port) &&
+                      timing_port > 0 && timing_port <= UINT16_MAX;
+      if (uses_ptp) {
         conn->protocol_version = 2;
-        ptp_clock_set_peer(conn, conn->client_ip);
+        conn->ptp_requested = true;
       }
-      if (has_timing && strcmp(timing_protocol, "NTP") == 0 &&
-          bplist_find_int(body, body_len, "timingPort", &timing_port) &&
-          timing_port > 0 && timing_port <= UINT16_MAX) {
+      if (uses_ntp) {
         conn->protocol_version = 2;
         conn->client_timing_port = (uint16_t)timing_port;
-        if (!start_ntp_timing_or_fail(socket, conn, req)) {
-          return;
-        }
       }
       uint8_t plist_body[128];
       size_t plist_len = bplist_build_initial_setup(
@@ -1297,6 +1244,7 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
                            NULL, 0);
         return;
       }
+      conn->initial_audio_setup_complete = conn->encrypted_mode && (uses_ptp || uses_ntp);
       rtsp_send_response(socket, conn, 200, "OK", req->cseq,
                          "Content-Type: application/x-apple-binary-plist\r\n",
                          (const char *)plist_body, plist_len);
@@ -1347,8 +1295,9 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
   // Buffered streams (type 103) schedule playout with the anchor directly.
   // Only applied on the AirPlay 2 (bplist SETUP) path; the AirPlay 1 path
   // keeps its existing behavior (0) — no field evidence either way there.
+  uint32_t negotiated_latency = 0;
   if (!is_bplist || buffered) {
-    audio_receiver_set_playout_latency_samples(0);
+    audio_receiver_set_playout_latency_samples(0, 0);
   } else {
     int64_t latency_min = 0;
     const char *latency_src = "default";
@@ -1372,9 +1321,19 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     } else {
       latency_min = AIRPLAY_RT_LATENCY_DEFAULT_SAMPLES;
     }
-    audio_receiver_set_playout_latency_samples((uint32_t)latency_min);
+    uint64_t min_samples = (uint64_t)stream_sample_rate *
+                           AIRPLAY_EARLY_RECORD_MIN_LATENCY_MS / 1000;
+    if (conn->early_record_received && (uint64_t)latency_min < min_samples) {
+      negotiated_latency = (uint32_t)min_samples;
+      latency_min = negotiated_latency;
+      latency_src = "receiver minimum";
+    }
+    // Leave half of the sender's playout window for transport jitter.
+    uint32_t preroll_limit = conn->early_record_received ? (uint32_t)latency_min / 2U : 0;
+    audio_receiver_set_playout_latency_samples((uint32_t)latency_min, preroll_limit);
     ESP_LOGI(TAG, "Realtime playout latency: %lld samples (%lld ms, %s)",
-             (long long)latency_min, (long long)(latency_min * 1000 / 44100),
+             (long long)latency_min,
+             (long long)(latency_min * 1000 / stream_sample_rate),
              latency_src);
   }
 
@@ -1384,7 +1343,8 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
         plist_body, sizeof(plist_body), stream_type, response_data_port,
         conn->control_port,
         stream_type == 103 ? AP2_AUDIO_BUFFER_SIZE
-                           : AP2_REALTIME_AUDIO_BUFFER_SIZE);
+                           : AP2_REALTIME_AUDIO_BUFFER_SIZE,
+        negotiated_latency);
     if (plist_len == 0) {
       audio_receiver_stop();
       rtsp_send_response(socket, conn, 500, "Internal Error", req->cseq, NULL,

@@ -11,3 +11,12 @@ SETUP. The NTP client samples more frequently until it locks. RTSP reports
 the effective playback volume from the application's USB output settings.
 For AirPlay 2 senders that yield in PTP clock selection, the receiver also
 serves its local clock by unicast to the authenticated session peer.
+RTSP discovery and auxiliary control connections can coexist with an active
+stream. Audio setup alone takes ownership of shared playback and timing.
+An authenticated AirPlay 2 session with negotiated timing can acknowledge
+AirFlash's early RECORD before the stream SETUP. When the authenticated peer
+provides the PTP clock, the receiver sends unicast Delay_Req messages to that
+peer so senders that wait for a timing exchange can start streaming.
+For realtime streams that follow the early-RECORD sequence, the receiver
+negotiates a 50 ms minimum playout latency if the sender requests less and
+caps startup preroll at half of the stream's playout latency.

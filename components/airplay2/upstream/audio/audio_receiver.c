@@ -356,8 +356,12 @@ void audio_receiver_set_encryption(const audio_encrypt_t *encrypt) {
   }
 }
 
-void audio_receiver_set_playout_latency_samples(uint32_t latency_samples) {
+void audio_receiver_set_playout_latency_samples(uint32_t latency_samples,
+                                                uint32_t preroll_limit_samples) {
   audio_timing_set_playout_latency(&receiver.timing, latency_samples);
+  if (receiver.engine_v2_ready) {
+    audio_engine_v2_set_preroll_limit(&receiver.engine_v2, preroll_limit_samples);
+  }
 }
 
 void audio_receiver_set_output_latency_us(uint32_t latency_us) {

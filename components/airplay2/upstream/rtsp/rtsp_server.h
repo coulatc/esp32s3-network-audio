@@ -5,6 +5,7 @@
 
 #include "esp_err.h"
 #include <stdint.h>
+#include "rtsp_conn.h"
 
 /**
  * Port the RTSP server listens on, which the mDNS advertisement must match.
@@ -20,6 +21,10 @@ uint16_t airplay_rtsp_port(void);
  * Handles initial connection requests from iOS devices
  */
 esp_err_t rtsp_server_start(void);
+
+// Called from serialized RTSP dispatch with the server request lock held.
+bool rtsp_playback_is_owner(const rtsp_conn_t *conn);
+bool rtsp_playback_claim(rtsp_conn_t *conn);
 
 /**
  * Stop the RTSP server

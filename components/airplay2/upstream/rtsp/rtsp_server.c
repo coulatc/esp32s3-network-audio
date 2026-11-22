@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -17,6 +18,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
 
 #include "rtsp_conn.h"
 #include "rtsp_crypto.h"
@@ -35,12 +37,14 @@ static const char *TAG = "rtsp_server";
 #define RTSP_BUFFER_INITIAL 4096
 #define RTSP_BUFFER_LARGE   ((size_t)256 * 1024)
 
+#define RTSP_CLIENT_COUNT 4
 #define CLIENT_STACK_SIZE 8192
 #define SERVER_STACK_SIZE 4096
 
 static int server_socket = -1;
 static TaskHandle_t server_task_handle = NULL;
-static bool server_running = false;
+static atomic_bool server_running;
+static SemaphoreHandle_t request_lock;
 
 // RTSP tasks are restartable. Use dynamic TCB allocation so
 // reconnect/start-stop paths cannot reuse static task memory before FreeRTOS
@@ -51,31 +55,79 @@ typedef struct {
   rtsp_conn_t *conn;
   TaskHandle_t task;
   int socket;
-  volatile bool should_stop;
-  volatile bool is_old; // Marked as old client being killed
+  atomic_bool should_stop;
 } client_slot_t;
 
-static client_slot_t clients[2] = {0}; // Current and old
-static int current_slot = 0;
+static client_slot_t clients[RTSP_CLIENT_COUNT];
+static client_slot_t *playback_owner;
 
 // Flag set by the play/pause button to tell the grace period loop
 // to send a DACP resume command and keep waiting for reconnect.
-static volatile bool s_resume_requested = false;
+static atomic_bool s_resume_requested;
 
-// Public API for volume control
-void airplay_set_volume(float volume_db) {
-  client_slot_t *c = &clients[current_slot];
-  if (c->conn && !c->is_old) {
-    rtsp_conn_set_volume(c->conn, volume_db);
+// Dispatch, stream handoff and cleanup share this lock. Socket reads and
+// the legacy DACP grace period stay outside it.
+bool rtsp_playback_is_owner(const rtsp_conn_t *conn) {
+  return playback_owner && playback_owner->conn == conn;
+}
+
+static void stop_playback(rtsp_conn_t *conn) {
+  ptp_clock_remove_peer(conn);
+  audio_receiver_stop();
+  audio_receiver_end_session();
+  audio_output_flush();
+  ntp_clock_stop();
+  ptp_clock_end_session();
+  ptp_clock_init(); // Resume passive PTP if legacy RAOP had stopped it.
+}
+
+static void clear_playback_owner(void) {
+  playback_owner = NULL;
+  dacp_clear_session();
+  playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_DISCONNECTED,
+                       NULL);
+}
+
+bool rtsp_playback_claim(rtsp_conn_t *conn) {
+  if (rtsp_playback_is_owner(conn)) return true;
+  client_slot_t *slot = NULL;
+  for (size_t i = 0; i < RTSP_CLIENT_COUNT; i++) {
+    if (clients[i].conn == conn) {
+      slot = &clients[i];
+      break;
+    }
   }
+  if (!slot || slot->should_stop) return false;
+  if (playback_owner) {
+    ESP_LOGI(TAG, "Replacing playback session after a new audio request");
+    playback_owner->should_stop = true;
+    if (playback_owner->socket >= 0) {
+      shutdown(playback_owner->socket, SHUT_RDWR);
+      stop_playback(playback_owner->conn);
+    }
+    clear_playback_owner();
+  }
+  playback_owner = slot;
+  if (conn->dacp_id[0] && conn->active_remote[0]) {
+    dacp_set_session(conn->dacp_id, conn->active_remote, conn->client_ip);
+  }
+  playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_CONNECTED, NULL);
+  return true;
+}
+
+void airplay_set_volume(float volume_db) {
+  if (!request_lock) return;
+  xSemaphoreTake(request_lock, portMAX_DELAY);
+  if (playback_owner) rtsp_conn_set_volume(playback_owner->conn, volume_db);
+  xSemaphoreGive(request_lock);
 }
 
 int32_t airplay_get_volume_q15(void) {
-  client_slot_t *c = &clients[current_slot];
-  if (c->conn && !c->is_old) {
-    return rtsp_conn_get_volume_q15(c->conn);
-  }
-  return 16384; // 50% volume for new clients
+  if (!request_lock) return 16384;
+  xSemaphoreTake(request_lock, portMAX_DELAY);
+  int32_t result = playback_owner ? rtsp_conn_get_volume_q15(playback_owner->conn) : 16384;
+  xSemaphoreGive(request_lock);
+  return result;
 }
 
 void rtsp_server_request_resume(void) {
@@ -141,7 +193,11 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
     // the message boundary (buffer capacity > total_len).
     uint8_t saved = buffer[total_len];
     buffer[total_len] = '\0';
-    rtsp_dispatch(slot->socket, slot->conn, buffer, total_len);
+    xSemaphoreTake(request_lock, portMAX_DELAY);
+    if (!slot->should_stop) {
+      rtsp_dispatch(slot->socket, slot->conn, buffer, total_len);
+    }
+    xSemaphoreGive(request_lock);
     buffer[total_len] = saved;
     free(header_str);
 
@@ -152,55 +208,47 @@ static void process_rtsp_buffer(client_slot_t *slot, uint8_t *buffer,
   }
 }
 
+static void close_client_slot(client_slot_t *slot) {
+  if (slot->socket >= 0) close(slot->socket);
+  slot->socket = -1;
+  slot->conn = NULL;
+  slot->should_stop = false;
+  slot->task = NULL;
+}
+
 // Client task
 static void client_task(void *pvParameters) {
   int slot_idx = (int)(intptr_t)pvParameters;
   client_slot_t *slot = &clients[slot_idx];
-
-  // Create connection state
   rtsp_conn_t *conn = rtsp_conn_create();
-  if (!conn) {
-    ESP_LOGE(TAG, "Failed to create connection state");
-    close(slot->socket);
-    slot->socket = -1;
-    slot->task = NULL;
+  size_t buf_capacity = RTSP_BUFFER_INITIAL;
+  uint8_t *buffer = conn ? malloc(buf_capacity) : NULL;
+  if (!buffer) {
+    ESP_LOGE(TAG, "Failed to allocate connection resources");
+    rtsp_conn_free(conn);
+    xSemaphoreTake(request_lock, portMAX_DELAY);
+    close_client_slot(slot);
+    xSemaphoreGive(request_lock);
     vTaskDelete(NULL);
     return;
   }
-  slot->conn = conn;
 
-  // Get client IP address for timing requests
+  // Get client IP address for timing requests.
   struct sockaddr_in peer_addr;
   socklen_t peer_len = sizeof(peer_addr);
-  if (getpeername(slot->socket, (struct sockaddr *)&peer_addr, &peer_len) ==
-      0) {
+  if (getpeername(slot->socket, (struct sockaddr *)&peer_addr, &peer_len) == 0) {
     conn->client_ip = peer_addr.sin_addr.s_addr;
-    ESP_LOGI(TAG, "Client IP: %u.%u.%u.%u",
-             (unsigned int)(conn->client_ip & 0xFF),
-             (unsigned int)((conn->client_ip >> 8) & 0xFF),
-             (unsigned int)((conn->client_ip >> 16) & 0xFF),
-             (unsigned int)((conn->client_ip >> 24) & 0xFF));
   }
-
-  // Allocate buffer
-  size_t buf_capacity = RTSP_BUFFER_INITIAL;
-  uint8_t *buffer = malloc(buf_capacity);
-  if (!buffer) {
-    ESP_LOGE(TAG, "Failed to allocate buffer");
-    rtsp_conn_free(conn);
-    slot->conn = NULL;
-    close(slot->socket);
-    slot->socket = -1;
-    slot->task = NULL;
-    vTaskDelete(NULL);
-    return;
-  }
+  xSemaphoreTake(request_lock, portMAX_DELAY);
+  slot->conn = conn;
+  xSemaphoreGive(request_lock);
 
   size_t buf_len = 0;
 
   // Socket timeout for stop signal responsiveness
   struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
   setsockopt(slot->socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  setsockopt(slot->socket, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
   // Disable Nagle: RTSP control commands (volume, pause) are tiny and must
   // not wait for coalescing/delayed-ACK, which adds tens to hundreds of ms of
@@ -272,147 +320,56 @@ static void client_task(void *pvParameters) {
 cleanup:
   ESP_LOGI(TAG, "Client slot %d disconnected", slot_idx);
   free(buffer);
+
+  xSemaphoreTake(request_lock, portMAX_DELAY);
   close(slot->socket);
   slot->socket = -1;
-
-  // Immediate: stop audio and NTP
-  ptp_clock_remove_peer(conn);
-  audio_receiver_stop();
-  if (!slot->is_old) {
-    // The socket is gone, so the claim on the audio path goes with it. The DACP
-    // grace period below only decides when to report a disconnect. A replaced
-    // connection releases nothing: is_old is set before the replacement is
-    // accepted, so its SETUP already owns the claim.
-    audio_receiver_end_session();
-  }
-  audio_output_flush();
-  ntp_clock_stop();
-
-  bool has_dacp_remote = conn && conn->protocol_version == 1 &&
-                         conn->dacp_id[0] != '\0' &&
-                         conn->active_remote[0] != '\0';
-
-  // iOS v1 pause handling needs DACP to distinguish pause from disconnect.
-  // Third-party RAOP clients often have no DACP remote; disconnect them
-  // immediately instead of delaying slot cleanup with an iOS-only grace path.
-  if (has_dacp_remote) {
-    if (!slot->should_stop) {
+  bool grace = false;
+  if (playback_owner == slot) {
+    stop_playback(conn);
+    grace = conn->protocol_version == 1 && conn->dacp_id[0] &&
+            conn->active_remote[0] && !slot->should_stop;
+    if (grace) {
       s_resume_requested = false;
       playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_PAUSED,
                            NULL);
-
-      // Phase 1: let mDNS settle (3 s), but exit early on resume or reconnect
-      for (int i = 0; i < 6 && !slot->should_stop; i++) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        if (s_resume_requested) {
-          ESP_LOGI(TAG,
-                   "Resume requested during Phase 1 — skipping to Phase 2");
-          break;
-        }
-      }
-
-      // Phase 2: wait for reconnect as long as DACP service is advertised.
-      // Re-probe every ~5 s. The phone unadvertises the service when the
-      // user switches away, so disappearance = genuine disconnect.
-      if (!slot->should_stop) {
-        bool stay = dacp_probe_service() || s_resume_requested;
-        if (s_resume_requested) {
-          s_resume_requested = false;
-          ESP_LOGI(TAG, "Resume requested via button — waiting for reconnect");
-          stay = true;
-        }
-        if (stay) {
-          ESP_LOGI(TAG, "DACP still advertised — waiting for reconnect");
-        }
-        while (stay && !slot->should_stop) {
-          // Wait 5 s between probes (10 × 500 ms), checking flags each tick
-          for (int i = 0; i < 10 && !slot->should_stop; i++) {
-            vTaskDelay(pdMS_TO_TICKS(500));
-            if (s_resume_requested) {
-              s_resume_requested = false;
-              ESP_LOGI(TAG,
-                       "Resume requested via button — extending grace period");
-            }
-          }
-          if (slot->should_stop) {
-            break;
-          }
-          // Re-probe: still advertised?
-          stay = dacp_probe_service();
-          if (stay) {
-            ESP_LOGD(TAG, "DACP still advertised — continuing wait");
-          } else {
-            ESP_LOGI(TAG, "DACP service gone — genuine disconnect");
-          }
-        }
-      }
-
-      if (slot->is_old) {
-        // New client connected during grace period — treat as reconnect
-        ESP_LOGI(TAG, "Client reconnected during grace period");
-      } else {
-        ESP_LOGI(TAG, "Grace period expired — full disconnect");
-        dacp_clear_session();
-        playback_events_emit(PLAYBACK_SOURCE_AIRPLAY,
-                             PLAYBACK_EVENT_DISCONNECTED, NULL);
-      }
     } else {
-      // Forcefully stopped (server shutdown or replaced by new client)
-      dacp_clear_session();
-      playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_DISCONNECTED,
-                           NULL);
+      clear_playback_owner();
     }
-  } else {
-    // v2 / unknown — no grace period, clear immediately.
-    dacp_clear_session();
-    playback_events_emit(PLAYBACK_SOURCE_AIRPLAY, PLAYBACK_EVENT_DISCONNECTED,
-                         NULL);
+  }
+  xSemaphoreGive(request_lock);
+
+  // Preserve classic RAOP pause detection without blocking the control server.
+  if (grace) {
+    bool stay = true;
+    int polls = 6; // First allow three seconds for mDNS to settle.
+    while (stay && !slot->should_stop) {
+      for (int i = 0; i < polls && !slot->should_stop && !s_resume_requested; i++) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+      }
+      if (slot->should_stop) break;
+      if (atomic_exchange(&s_resume_requested, false)) {
+        dacp_send_playpause();
+      } else {
+        stay = dacp_probe_service();
+      }
+      polls = 10;
+    }
+    xSemaphoreTake(request_lock, portMAX_DELAY);
+    if (playback_owner == slot) clear_playback_owner();
+    xSemaphoreGive(request_lock);
   }
 
-  // When being replaced by a new client (is_old), skip global state changes —
-  // the new session's SETUP already manages PTP and the event port task.
-  if (!slot->is_old) {
-    ptp_clock_init(); // Restart PTP (stopped during v1 SETUP to free sockets)
-    rtsp_stop_event_port_task();
-  } else if (rtsp_event_port_listen_socket() >= 0 &&
-             rtsp_event_port_listen_socket() == conn->event_socket) {
-    // Old task still using our socket — stop it before closing
-    rtsp_stop_event_port_task();
-  }
-
-  if (conn->event_socket >= 0) {
-    close(conn->event_socket);
-    conn->event_socket = -1;
-  }
-
-  rtsp_conn_cleanup(conn);
-  rtsp_conn_free(conn);
-
+  // Event sockets, crypto and other connection state belong to this client.
+  // The slot is unavailable for reuse until its local cleanup completes.
+  xSemaphoreTake(request_lock, portMAX_DELAY);
   slot->conn = NULL;
-  slot->socket = -1;
-  slot->task = NULL;
-  slot->should_stop = false;
-  slot->is_old = false;
-
+  xSemaphoreGive(request_lock);
+  rtsp_conn_free(conn);
+  xSemaphoreTake(request_lock, portMAX_DELAY);
+  close_client_slot(slot);
+  xSemaphoreGive(request_lock);
   vTaskDelete(NULL);
-}
-
-// Signal old client to stop (non-blocking)
-static void signal_old_client_stop(int old_slot) {
-  client_slot_t *old = &clients[old_slot];
-  if (old->task == NULL) {
-    return;
-  }
-
-  ESP_LOGI(TAG, "Signaling old client to stop");
-  old->is_old = true;
-  old->should_stop = true;
-
-  // Shutdown socket to unblock recv
-  if (old->socket >= 0) {
-    shutdown(old->socket, SHUT_RDWR);
-  }
-  // Task will clean itself up
 }
 
 static void server_task(void *pvParameters) {
@@ -421,14 +378,7 @@ static void server_task(void *pvParameters) {
   struct sockaddr_in server_addr, client_addr;
   socklen_t client_addr_len = sizeof(client_addr);
 
-  // Initialize slots
-  for (int i = 0; i < 2; i++) {
-    clients[i].socket = -1;
-    clients[i].conn = NULL;
-    clients[i].task = NULL;
-    clients[i].should_stop = false;
-    clients[i].is_old = false;
-  }
+  for (size_t i = 0; i < RTSP_CLIENT_COUNT; i++) clients[i].socket = -1;
 
   server_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (server_socket < 0) {
@@ -478,62 +428,46 @@ static void server_task(void *pvParameters) {
       continue;
     }
 
-    ESP_LOGI(TAG, "New client connected");
-
-    // Find slot for new client (alternate between 0 and 1)
-    int new_slot = 1 - current_slot;
-
-    // If new slot still has a running task, wait for it to fully exit.
-    // With static TCBs we MUST NOT reuse until the old task is deleted.
-    if (clients[new_slot].task != NULL) {
-      clients[new_slot].should_stop = true;
-      if (clients[new_slot].socket >= 0) {
-        shutdown(clients[new_slot].socket, SHUT_RDWR);
-      }
-      int timeout = 30; // 3 seconds max
-      while (clients[new_slot].task != NULL && timeout > 0) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        timeout--;
-      }
-      if (clients[new_slot].task != NULL) {
-        ESP_LOGE(TAG, "Slot %d task did not exit in time", new_slot);
-        close(new_socket);
-        continue;
+    // Accept discovery, pairing and auxiliary control sockets without
+    // touching an existing playback session. Only audio SETUP claims it.
+    xSemaphoreTake(request_lock, portMAX_DELAY);
+    int free_slot = -1;
+    for (int i = 0; i < RTSP_CLIENT_COUNT; i++) {
+      if (clients[i].task == NULL) {
+        free_slot = i;
+        break;
       }
     }
-    // Signal old client to stop (in background)
-    signal_old_client_stop(current_slot);
-
-    // Setup new slot
-    clients[new_slot].socket = new_socket;
-    clients[new_slot].should_stop = false;
-    clients[new_slot].is_old = false;
-
-    // Start new client task immediately.
-    clients[new_slot].task = NULL;
-    BaseType_t task_ret =
-        xTaskCreate(client_task, "rtsp_client", CLIENT_STACK_SIZE,
-                    (void *)(intptr_t)new_slot, 5, &clients[new_slot].task);
-    if (task_ret != pdPASS || clients[new_slot].task == NULL) {
-      ESP_LOGE(TAG, "Failed to create client task");
-      close(new_socket);
-      clients[new_slot].socket = -1;
+    if (free_slot >= 0) {
+      client_slot_t *slot = &clients[free_slot];
+      slot->socket = new_socket;
+      slot->should_stop = false;
+      if (xTaskCreate(client_task, "rtsp_client", CLIENT_STACK_SIZE,
+                      (void *)(intptr_t)free_slot, 5, &slot->task) != pdPASS) {
+        close_client_slot(slot);
+      }
     } else {
-      current_slot = new_slot;
+      ESP_LOGW(TAG, "No free RTSP client slot");
+      close(new_socket);
     }
+    xSemaphoreGive(request_lock);
   }
 
-  // Stop all clients
-  for (int i = 0; i < 2; i++) {
-    if (clients[i].task != NULL) {
-      clients[i].should_stop = true;
-      if (clients[i].socket >= 0) {
-        shutdown(clients[i].socket, SHUT_RDWR);
+  bool pending;
+  do {
+    pending = false;
+    xSemaphoreTake(request_lock, portMAX_DELAY);
+    for (size_t i = 0; i < RTSP_CLIENT_COUNT; i++) {
+      client_slot_t *slot = &clients[i];
+      if (slot->task != NULL) {
+        pending = true;
+        slot->should_stop = true;
+        if (slot->socket >= 0) shutdown(slot->socket, SHUT_RDWR);
       }
     }
-  }
-
-  vTaskDelay(pdMS_TO_TICKS(500));
+    xSemaphoreGive(request_lock);
+    if (pending) vTaskDelay(pdMS_TO_TICKS(20));
+  } while (pending);
 
   if (server_socket >= 0) {
     close(server_socket);
@@ -562,6 +496,9 @@ esp_err_t rtsp_server_start(void) {
       return ESP_ERR_INVALID_STATE;
     }
   }
+
+  if (!request_lock) request_lock = xSemaphoreCreateMutex();
+  if (!request_lock) return ESP_ERR_NO_MEM;
 
   // Parsing the key and deriving the first blinding pair costs the best part
   // of a second; a sender waiting on its OPTIONS response gives up before

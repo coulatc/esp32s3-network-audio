@@ -320,7 +320,8 @@ size_t bplist_build_initial_setup(uint8_t *out, size_t capacity,
 size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
                                  int64_t stream_type, uint16_t data_port,
                                  uint16_t control_port,
-                                 uint32_t audio_buffer_size) {
+                                 uint32_t audio_buffer_size,
+                                 uint32_t latency_min_samples) {
   if (capacity < 200) {
     return 0;
   }
@@ -380,6 +381,25 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
   out[pos++] = (audio_buffer_size >> 8) & 0xFF;
   out[pos++] = audio_buffer_size & 0xFF;
 
+  uint8_t latency_key = 0;
+  uint8_t latency_value = 0;
+  if (latency_min_samples > 0) {
+    latency_key = (uint8_t)obj;
+    offsets[obj++] = pos;
+    out[pos++] = 0x5A;
+    memcpy(out + pos, "latencyMin", 10);
+    pos += 10;
+
+    latency_value = (uint8_t)obj;
+    offsets[obj++] = pos;
+    out[pos++] = 0x12;
+    out[pos++] = (latency_min_samples >> 24) & 0xFF;
+    out[pos++] = (latency_min_samples >> 16) & 0xFF;
+    out[pos++] = (latency_min_samples >> 8) & 0xFF;
+    out[pos++] = latency_min_samples & 0xFF;
+  }
+
+  uint8_t stream_dict = (uint8_t)obj;
   offsets[obj++] = pos;
   if (audio_stream_uses_buffer((audio_stream_type_t)stream_type)) {
     out[pos++] = 0xD4;
@@ -392,23 +412,27 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
     out[pos++] = 8;
     out[pos++] = 7;
   } else {
-    out[pos++] = 0xD3;
+    out[pos++] = latency_key ? 0xD4 : 0xD3;
     out[pos++] = 1;
     out[pos++] = 2;
     out[pos++] = 3;
+    if (latency_key) out[pos++] = latency_key;
     out[pos++] = 5;
     out[pos++] = 6;
     out[pos++] = 7;
+    if (latency_key) out[pos++] = latency_value;
   }
 
+  uint8_t stream_array = (uint8_t)obj;
   offsets[obj++] = pos;
   out[pos++] = 0xA1;
-  out[pos++] = 9;
+  out[pos++] = stream_dict;
 
+  uint8_t root_dict = (uint8_t)obj;
   offsets[obj++] = pos;
   out[pos++] = 0xD1;
   out[pos++] = 0;
-  out[pos++] = 10;
+  out[pos++] = stream_array;
 
   size_t offset_table_offset = pos;
   for (size_t i = 0; i < obj; i++) {
@@ -431,7 +455,7 @@ size_t bplist_build_stream_setup(uint8_t *out, size_t capacity,
   for (int i = 0; i < 7; i++) {
     out[pos++] = 0;
   }
-  out[pos++] = 11;
+  out[pos++] = root_dict;
 
   for (int i = 0; i < 7; i++) {
     out[pos++] = 0;

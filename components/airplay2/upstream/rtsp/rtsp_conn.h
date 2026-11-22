@@ -4,6 +4,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 
 #include "hap.h"
@@ -30,6 +31,8 @@ struct rtsp_conn {
   float volume_db;
 
   // Audio streaming state
+  bool initial_audio_setup_complete;
+  bool early_record_received;
   bool stream_active;
   bool stream_paused;
   int64_t stream_type;    // 96=UDP realtime, 103=TCP buffered
@@ -41,11 +44,15 @@ struct rtsp_conn {
   int data_socket;
   int control_socket;
   int event_socket; // TCP listener for event port
+  atomic_bool event_running;
+  atomic_bool event_stop;
 
   // Client address for AirPlay 1 timing requests
   uint32_t client_ip;           // Client IP (network byte order)
   uint16_t client_timing_port;  // Client's timing port (for sending requests)
   uint16_t client_control_port; // Client's control port
+
+  bool ptp_requested;
 
   // Codec info from ANNOUNCE/SETUP
   char codec[32];

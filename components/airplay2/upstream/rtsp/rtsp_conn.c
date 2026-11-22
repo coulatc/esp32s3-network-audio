@@ -7,9 +7,8 @@
 #include <string.h>
 #include <unistd.h>
 
-#include "audio_receiver.h"
 #include "esp_log.h"
-#include "ptp_clock.h"
+#include "rtsp_handlers.h"
 #include "settings.h"
 
 static const char *TAG = "rtsp_conn";
@@ -40,6 +39,8 @@ rtsp_conn_t *rtsp_conn_create(void) {
   conn->data_socket = -1;
   conn->control_socket = -1;
   conn->event_socket = -1;
+  atomic_init(&conn->event_running, false);
+  atomic_init(&conn->event_stop, false);
 
   return conn;
 }
@@ -96,6 +97,7 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
     conn->control_socket = -1;
   }
   if (conn->event_socket >= 0) {
+    rtsp_stop_event_port_task(conn);
     close(conn->event_socket);
     conn->event_socket = -1;
   }
@@ -108,9 +110,6 @@ void rtsp_conn_cleanup(rtsp_conn_t *conn) {
   conn->timing_port = 0;
   conn->event_port = 0;
   conn->buffered_port = 0;
-
-  // Clear PTP clock for fresh sync on next connection
-  ptp_clock_clear();
 
   // Reset encryption state
   conn->encrypted_mode = false;

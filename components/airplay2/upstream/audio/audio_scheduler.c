@@ -609,6 +609,8 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
 
   if (scheduler->state != AUDIO_SCHED_PLAYING) {
     uint32_t start_rtp = 0;
+    uint32_t preroll_samples =
+        __atomic_load_n(&scheduler->preroll_samples, __ATOMIC_RELAXED);
     scheduler->start_attempts++;
 
     /* Audio behind the playout position can never be used, but the ring origin
@@ -629,7 +631,7 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
      * returns the same RTP value, rather than rounding to the next block
      * boundary. */
     if (audio_timeline_find_contiguous_from(
-            timeline, scheduler->epoch, wanted_rtp, scheduler->preroll_samples,
+            timeline, scheduler->epoch, wanted_rtp, preroll_samples,
             0U, &start_rtp)) {
       scheduler->cursor_rtp = start_rtp;
       /* O(1): older preroll becomes lazily reclaimable on ring collision.
@@ -666,7 +668,7 @@ size_t audio_scheduler_render(audio_scheduler_t *scheduler,
        * preroll and starts again, which is the double `start decision' plus
        * conceal seen after a seek.  Require a quarter of the configured
        * preroll so arriving AAC frames have somewhere to land first. */
-      uint32_t fallback_samples = scheduler->preroll_samples / 4U;
+      uint32_t fallback_samples = preroll_samples / 4U;
       if (fallback_samples < AUDIO_V2_BLOCK_SAMPLES) {
         fallback_samples = AUDIO_V2_BLOCK_SAMPLES;
       }

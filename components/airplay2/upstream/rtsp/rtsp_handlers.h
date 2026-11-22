@@ -95,6 +95,4 @@ int rtsp_dispatch(int socket, rtsp_conn_t *conn, const uint8_t *raw_request,
 void rtsp_get_device_id(char *device_id, size_t len);
 
 // Event port task management
-esp_err_t rtsp_start_event_port_task(int listen_socket);
-void rtsp_stop_event_port_task(void);
-int rtsp_event_port_listen_socket(void);
+void rtsp_stop_event_port_task(rtsp_conn_t *conn);

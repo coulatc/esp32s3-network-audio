@@ -26,6 +26,8 @@
 
 - AirPlay 2 在局域网通过 Bonjour 发布 `_airplay._tcp`。固件实现 HAP 配对、加密 RTSP、实时和缓冲音频接收，并由 USB Host 音频路径输出。多房间同步及各 iOS 应用的视频音频投送仍需在 Apple 设备上验证。
 - WinAirCast 等可让接收端担任主时钟的电脑投放软件，在当前 AirPlay 2 会话中可以使用设备的单播 PTP 时钟。由发送端提供时钟的会话继续使用发送端时钟。
+- AirPlay 发现、配对和辅助控制使用独立的 RTSP 连接。设备在新的音频流请求建立时切换播放会话。
+- Windows AirFlash 可通过 AirPlay 2 投放。接收器支持 AirFlash 在配置音频流前发送的 `RECORD`，并在跟随发送端时钟时主动进行 PTP 延迟交换。如果这类实时连接请求低于 50 ms，接收器会在握手时返回 50 ms。AirFlash 的强制延迟会忽略协商值。
 - DLNA 实现了 SSDP 发现、UPnP MediaRenderer 描述及 AVTransport、RenderingControl、ConnectionManager 控制。接收播放地址，由板子通过 HTTP/HTTPS 读取 MP3、WAV 或原生 FLAC，提供播放、暂停、停止、音量和静音。要切换曲目，由控制端提交下一个 URI。
 - DAC 输出是双声道 PCM，通过 UAC1 或 UAC2。不同 CX31993 成品的 USB 描述符可能不同，能启用的格式以设备后台实际显示为准。输入和输出采样率不同时使用线性重采样。位深选项控制 USB 输出的数据格式。
 

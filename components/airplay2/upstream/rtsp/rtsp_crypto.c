@@ -48,9 +48,10 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
       continue;
     }
     if (r == 0) {
-      return -1; // peer closed
+      errno = ECONNRESET;
+      return -1;
     }
-    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+    if (errno == EINTR || (received > 0 && (errno == EAGAIN || errno == EWOULDBLOCK))) {
       continue;
     }
     return -1;
@@ -61,6 +62,7 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
   if (block_len == 0 || block_len > RTSP_ENCRYPTED_BLOCK_MAX ||
       block_len > buffer_size) {
     ESP_LOGE(TAG, "Invalid encrypted block length: %d", block_len);
+    errno = EPROTO;
     return -1;
   }
 
@@ -69,6 +71,7 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
   uint8_t *encrypted = malloc(encrypted_len);
   if (!encrypted) {
     ESP_LOGE(TAG, "Failed to allocate encrypted buffer");
+    errno = ENOMEM;
     return -1;
   }
 
@@ -81,7 +84,8 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
     }
     if (r == 0) {
       free(encrypted);
-      return -1; // peer closed
+      errno = ECONNRESET;
+      return -1;
     }
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
       continue;
@@ -100,6 +104,7 @@ int rtsp_crypto_read_block(int socket, rtsp_conn_t *conn, uint8_t *buffer,
           sizeof(len_buf), nonce, conn->hap_session->decrypt_key) != 0) {
     free(encrypted);
     ESP_LOGE(TAG, "Failed to decrypt frame");
+    errno = EPROTO;
     return -1;
   }
   free(encrypted);

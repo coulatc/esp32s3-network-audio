@@ -1,4 +1,7 @@
 #include "audio.h"
+#include "audio_meter.h"
+#include "esp_timer.h"
+#include "volume.h"
 
 #include <stdatomic.h>
 #include <string.h>
@@ -13,6 +16,8 @@
 #define OUTPUT_PACKET_MAX 600
 #define PCM_BLOCK_SIZE 768
 #define MAX_FORMATS 48
+#define GAIN_RAMP_MS 180
+#define GAIN_RAMP_SHIFT 8
 
 typedef enum { UAC1 = 1, UAC2 = 2 } usb_class_t;
 typedef struct {
@@ -22,6 +27,7 @@ typedef struct {
 
 typedef struct {
     uint32_t generation;
+    audio_source_t source;
     size_t length;
     uint8_t data[PCM_BLOCK_SIZE];
 } pcm_block_t;
@@ -31,13 +37,51 @@ static const uint32_t rates[] = {44100, 48000, 32000, 88200, 96000, 24000, 22050
                                  16000, 11025, 8000, 64000, 176400, 192000};
 static QueueHandle_t connections, pcm_queue;
 static SemaphoreHandle_t lock;
-static atomic_uint generation = 1, active_encoding, written_bytes;
+static atomic_uint generation = 1, active_encoding, written_bytes, written_gain;
 static atomic_int owner = -1;
 static atomic_bool detached, stream_failed;
 static audio_format_t preferred, supported[MAX_FORMATS];
 static unsigned supported_count, requested_version;
 static unsigned active_class;
 static const char *message = "等待 USB DAC";
+
+static int32_t read_sample(const uint8_t *at, unsigned bytes)
+{
+    // PCM is little-endian; align samples to the most significant bits.
+    uint32_t value = 0;
+    for (unsigned i = 0; i < bytes; i++) value |= (uint32_t)at[i] << (8 * (i + 4 - bytes));
+    return (int32_t)value;
+}
+
+static void write_sample(uint8_t *at, int32_t sample, audio_format_t format)
+{
+    uint32_t mask = UINT32_MAX << (32 - format.bits);
+    uint32_t packed = ((uint32_t)sample & mask) >> (32 - format.bytes * 8);
+    for (unsigned b = 0; b < format.bytes; b++) at[b] = packed >> (8 * b);
+}
+
+static unsigned limit_block(pcm_block_t *block, audio_format_t format, unsigned current)
+{
+    unsigned target = volume_gain(block->source) << GAIN_RAMP_SHIFT;
+    if (current > target) current = target;
+    if (current == (VOLUME_UNITY << GAIN_RAMP_SHIFT)) return current;
+    if (!format.bits) format.bits = 32;
+
+    // Start new audio from zero and ramp increases. Apply decreases on the next block.
+    unsigned step = ((uint64_t)VOLUME_UNITY << GAIN_RAMP_SHIFT) * 1000 / (format.rate * GAIN_RAMP_MS);
+    unsigned stride = format.bytes * 2;
+    for (size_t i = 0; i < block->length; i += stride) {
+        if (target - current < step) current = target;
+        else current += step;
+        unsigned q15 = current >> GAIN_RAMP_SHIFT;
+        for (unsigned ch = 0; ch < 2; ch++) {
+            uint8_t *sample = block->data + i + ch * format.bytes;
+            int32_t scaled = (int64_t)read_sample(sample, format.bytes) * q15 / VOLUME_UNITY;
+            write_sample(sample, scaled, format);
+        }
+    }
+    return current;
+}
 
 static bool same_format(audio_format_t a, audio_format_t b)
 {
@@ -227,6 +271,9 @@ static void process_device(connection_t connection)
     unsigned applied = UINT32_MAX;
     bool streaming = false;
     pcm_block_t block;
+    uint32_t output_generation = 0;
+    unsigned current_gain = 0;
+    bool reported_pcm = false;
     while (!atomic_load(&detached)) {
         xSemaphoreTake(lock, portMAX_DELAY);
         audio_format_t target = preferred;
@@ -273,10 +320,26 @@ static void process_device(connection_t connection)
         }
 
         if (xQueueReceive(pcm_queue, &block, pdMS_TO_TICKS(20)) == pdTRUE &&
-            streaming && block.generation == atomic_load(&generation)) {
+            streaming && audio_is_owner(block.source) && block.generation == atomic_load(&generation)) {
+            if (output_generation != block.generation) {
+                output_generation = block.generation;
+                current_gain = 0;
+                reported_pcm = false;
+            }
+            audio_format_t format = decode_format(atomic_load(&active_encoding));
+            current_gain = limit_block(&block, format, current_gain);
             esp_err_t wrote = two ? uac2_host_device_write(two, block.data, block.length, 40) :
                                     uac_host_device_write(one, block.data, block.length, 40);
-            if (wrote == ESP_OK) atomic_fetch_add(&written_bytes, block.length);
+            if (wrote == ESP_OK) {
+                atomic_fetch_add(&written_bytes, block.length);
+                atomic_store(&written_gain, current_gain >> GAIN_RAMP_SHIFT);
+                if (!reported_pcm && block.generation == atomic_load(&generation)) {
+                    volume_pcm_started(block.source);
+                    reported_pcm = true;
+                }
+                audio_meter_feed(block.data, block.length, format.rate, format.bytes,
+                                 block.generation, esp_timer_get_time() / 1000);
+            }
         }
     }
 
@@ -374,6 +437,7 @@ static void clear_pending(void)
 
 void audio_claim(audio_source_t source)
 {
+    if (!audio_is_owner(source)) volume_source_started(source);
     atomic_store(&owner, (int)source);
     clear_pending();
 }
@@ -387,14 +451,6 @@ void audio_release(audio_source_t source)
 {
     int expected = source;
     if (atomic_compare_exchange_strong(&owner, &expected, -1)) clear_pending();
-}
-
-static int32_t read_sample(const uint8_t *at, unsigned bytes)
-{
-    // PCM is little-endian; align samples to the most significant bits.
-    uint32_t value = 0;
-    for (unsigned i = 0; i < bytes; i++) value |= (uint32_t)at[i] << (8 * (i + 4 - bytes));
-    return (int32_t)value;
 }
 
 static bool queue_block(audio_source_t source, pcm_block_t *block)
@@ -425,7 +481,7 @@ bool audio_write(audio_source_t source, audio_resampler_t *state, const uint8_t 
 
     unsigned input_slot = bits / 8, stride = input_slot * channels;
     unsigned output_stride = out.bytes * 2;
-    pcm_block_t block = { .generation = current_gen };
+    pcm_block_t block = { .generation = current_gen, .source = source };
     for (size_t pos = 0; pos + stride <= length; pos += stride) {
         int32_t sample[2];
         sample[0] = read_sample(pcm + pos, input_slot);
@@ -439,9 +495,8 @@ bool audio_write(audio_source_t source, audio_resampler_t *state, const uint8_t 
             for (unsigned ch = 0; ch < 2; ch++) {
                 int64_t delta = (int64_t)sample[ch] - state->previous[ch];
                 int32_t result = state->previous[ch] + delta * state->phase / out.rate;
-                uint32_t mask = UINT32_MAX << (32 - out.bits);
-                uint32_t packed = ((uint32_t)result & mask) >> (32 - out.bytes * 8);
-                for (unsigned b = 0; b < out.bytes; b++) block.data[block.length++] = packed >> (8 * b);
+                write_sample(block.data + block.length, result, out);
+                block.length += out.bytes;
             }
             if (block.length + output_stride > sizeof(block.data) && !queue_block(source, &block)) {
                 state->primed = false;
@@ -464,6 +519,8 @@ void audio_status(cJSON *status)
     cJSON_AddStringToObject(status, "usb", message);
     cJSON_AddNumberToObject(status, "uac", active_class);
     cJSON_AddNumberToObject(status, "usbBytesWritten", atomic_load(&written_bytes));
+    double gain = audio_ready() && atomic_load(&owner) >= 0 ? atomic_load(&written_gain) : 0;
+    cJSON_AddNumberToObject(status, "usbVolumePercent", gain * 100 / VOLUME_UNITY);
     audio_format_t active = decode_format(atomic_load(&active_encoding));
     cJSON_AddNumberToObject(status, "activeRate", active.rate);
     cJSON_AddNumberToObject(status, "activeBits", active.rate && !active.bits ? 32 : active.bits);

@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "audio.h"
+#include "volume.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_log.h"
@@ -27,7 +28,7 @@ static const char *TAG = "dlna_player";
 static SemaphoreHandle_t lock;
 static TaskHandle_t task;
 static atomic_uint generation;
-static player_snapshot_t status = { .state = NO_MEDIA_PRESENT, .volume = 100 };
+static player_snapshot_t status = { .state = NO_MEDIA_PRESENT };
 
 static bool cancelled(unsigned id)
 {
@@ -151,7 +152,6 @@ static bool decode(media_stream_t *stream)
         if (!frames || !can_decode(stream->generation)) break;
 
         xSemaphoreTake(lock, portMAX_DELAY);
-        unsigned gain = status.muted ? 0 : status.volume;
         if (stream->generation == atomic_load(&generation) && status.state != PAUSED) {
             status.state = PLAYING;
             status.position = played / rate;
@@ -159,12 +159,6 @@ static bool decode(media_stream_t *stream)
         }
         xSemaphoreGive(lock);
 
-        if (gain != 100) {
-            for (unsigned i = 0; i < frames * channels; i++) {
-                if (bits == 16) ((int16_t *)pcm)[i] = ((int16_t *)pcm)[i] * (int)gain / 100;
-                else pcm[i] = (int64_t)pcm[i] * gain / 100;
-            }
-        }
         while (!audio_ready() && can_decode(stream->generation)) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
@@ -316,16 +310,12 @@ void player_stop(void)
 
 void player_set_volume(unsigned value)
 {
-    xSemaphoreTake(lock, portMAX_DELAY);
-    status.volume = value;
-    xSemaphoreGive(lock);
+    volume_dlna_set(value);
 }
 
 void player_set_mute(bool muted)
 {
-    xSemaphoreTake(lock, portMAX_DELAY);
-    status.muted = muted;
-    xSemaphoreGive(lock);
+    volume_dlna_mute(muted);
 }
 
 void player_snapshot(player_snapshot_t *copy)
@@ -333,6 +323,7 @@ void player_snapshot(player_snapshot_t *copy)
     xSemaphoreTake(lock, portMAX_DELAY);
     *copy = status;
     xSemaphoreGive(lock);
+    copy->volume = volume_dlna_get(&copy->muted);
 }
 
 const char *player_state_name(player_state_t state)

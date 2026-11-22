@@ -11,15 +11,18 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
-#include "esp_raop_receiver.h"
+#include "airplay2.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "led_strip.h"
+#include "music_lights.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 #include "player.h"
+#include "volume.h"
 
 #define AP_PASSWORD "S3audio-setup"
 #define SETTINGS_KEY "settings_v1"
@@ -39,12 +42,11 @@ typedef struct {
 
 static const char *TAG = "s3_audio";
 static settings_t settings = { .rgb = 0x18A8FF, .led_mode = 2, .brightness = 20 };
-static atomic_uint led_settings, led_brightness;
+static atomic_uint led_settings, led_brightness, led_output_rgb;
 static atomic_bool station_connected, ap_enabled, airplay_playing, airplay_available;
 static esp_netif_t *station, *hotspot;
 static char ap_name[32], device_name[32], hostname[32];
 static uint8_t mac[6];
-static raop_handle_t *raop;
 static audio_resampler_t airplay_pcm;
 static TaskHandle_t network_task_handle;
 static bool restarting;
@@ -57,7 +59,7 @@ static void load_settings(void)
     settings_t saved;
     size_t size = sizeof(saved);
     if (nvs_get_blob(handle, SETTINGS_KEY, &saved, &size) == ESP_OK && size == sizeof(saved) &&
-        saved.ssid[32] == 0 && saved.password[64] == 0 && saved.led_mode <= 2 &&
+        saved.ssid[32] == 0 && saved.password[64] == 0 && saved.led_mode <= LIGHT_SPECTRUM &&
         saved.brightness <= 100 && saved.rgb <= 0xFFFFFF) settings = saved;
     nvs_close(handle);
 }
@@ -108,7 +110,17 @@ static void boot_reset_task(void *unused)
         esp_err_t err = ESP_ERR_INVALID_STATE;
         if (!restarting) {
             err = erase_settings();
-            restarting = err == ESP_OK;
+            if (err == ESP_OK) {
+                esp_err_t volume = volume_erase();
+                if (volume != ESP_OK) {
+                    ESP_LOGW(TAG, "Could not clear volume settings: %s", esp_err_to_name(volume));
+                }
+                esp_err_t pairing = airplay2_clear_settings();
+                if (pairing != ESP_OK) {
+                    ESP_LOGW(TAG, "Could not clear AirPlay settings: %s", esp_err_to_name(pairing));
+                }
+                restarting = true;
+            }
         }
         xSemaphoreGive(settings_write_lock);
         if (err == ESP_OK) {
@@ -222,18 +234,24 @@ static void led_task(void *unused)
     }
 
     uint32_t previous = UINT32_MAX;
-    bool illuminated = false;
+    light_mode_t last_mode = LIGHT_OFF;
+    music_lights_t effects = {0};
     while (true) {
         unsigned packed = atomic_load(&led_settings);
         unsigned rgb = packed & 0xFFFFFF;
-        unsigned mode = (packed >> 24) & 3;
+        light_mode_t mode = (packed >> 24) & 255;
+        uint32_t now_ms = esp_timer_get_time() / 1000;
+        if (mode != last_mode) {
+            effects = (music_lights_t){0};
+            last_mode = mode;
+        }
         unsigned brightness = atomic_load(&led_brightness);
-        if (mode == 0) rgb = 0;
-        if (mode == 2) {
+        if (mode == LIGHT_OFF) rgb = 0;
+        if (mode == LIGHT_STATUS) {
             player_snapshot_t player;
             player_snapshot(&player);
             if (!atomic_load(&station_connected) && atomic_load(&ap_enabled)) {
-                rgb = illuminated ? 0xFF8200 : 0;
+                rgb = (now_ms / 400) % 2 ? 0xFF8200 : 0;
             } else if ((atomic_load(&airplay_playing) && audio_is_owner(AUDIO_AIRPLAY)) ||
                        player.state == PLAYING) {
                 rgb = 0x08EA78;
@@ -241,35 +259,38 @@ static void led_task(void *unused)
                 rgb = 0xE63939;
             }
         }
+        bool reactive = mode >= LIGHT_LEVEL;
+        if (reactive) rgb = music_lights_color(&effects, mode, rgb, audio_meter_read(now_ms), now_ms);
         unsigned r = ((rgb >> 16) & 255) * brightness / 100;
         unsigned g = ((rgb >> 8) & 255) * brightness / 100;
         unsigned b = (rgb & 255) * brightness / 100;
         uint32_t applied = r << 16 | g << 8 | b;
         if (applied != previous) {
-            led_strip_set_pixel(strip, 0, r, g, b);
-            led_strip_refresh(strip);
-            previous = applied;
+            if (led_strip_set_pixel(strip, 0, r, g, b) == ESP_OK && led_strip_refresh(strip) == ESP_OK) {
+                atomic_store(&led_output_rgb, applied);
+                previous = applied;
+            }
         }
-        illuminated = !illuminated;
-        vTaskDelay(pdMS_TO_TICKS(400));
+        vTaskDelay(pdMS_TO_TICKS(reactive ? 20 : 80));
     }
 }
 
-static void airplay_audio(const uint8_t *data, size_t len, void *ctx)
+static void airplay_audio(const int16_t *samples, size_t frames, unsigned rate)
 {
-    audio_write(AUDIO_AIRPLAY, &airplay_pcm, data, len, 44100, 2, 16);
+    audio_write(AUDIO_AIRPLAY, &airplay_pcm, (const uint8_t *)samples,
+                frames * sizeof(*samples) * 2, rate, 2, 16);
 }
 
-static void airplay_event(raop_event_t event, void *payload, void *ctx)
+static void airplay_playback(bool playing)
 {
-    if (event == RAOP_EVENT_PLAYING) {
-        audio_claim(AUDIO_AIRPLAY);
-        atomic_store(&airplay_playing, true);
-    } else if (event == RAOP_EVENT_DISCONNECTED || event == RAOP_EVENT_STOPPED ||
-               event == RAOP_EVENT_PAUSED) {
-        audio_release(AUDIO_AIRPLAY);
-        atomic_store(&airplay_playing, false);
-    }
+    if (playing) audio_claim(AUDIO_AIRPLAY);
+    else audio_release(AUDIO_AIRPLAY);
+    atomic_store(&airplay_playing, playing);
+}
+
+static void airplay_flush(void)
+{
+    if (audio_is_owner(AUDIO_AIRPLAY)) audio_claim(AUDIO_AIRPLAY);
 }
 
 extern const char index_start[] asm("_binary_index_html_start");
@@ -319,6 +340,8 @@ static esp_err_t status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(json, "mode", settings.led_mode);
     cJSON_AddNumberToObject(json, "brightness", settings.brightness);
     cJSON_AddStringToObject(json, "color", color);
+    cJSON_AddNumberToObject(json, "ledRgb", atomic_load(&led_output_rgb));
+    volume_status(json);
     audio_status(json);
     return json_reply(req, json);
 }
@@ -326,6 +349,7 @@ static esp_err_t status_handler(httpd_req_t *req)
 static void restart_task(void *unused)
 {
     vTaskDelay(pdMS_TO_TICKS(800));
+    volume_save();
     esp_restart();
 }
 
@@ -364,7 +388,7 @@ static bool update_settings(const char *uri, cJSON *json, settings_t *next)
 
     const cJSON *color = cJSON_GetObjectItemCaseSensitive(json, "color");
     int mode, brightness;
-    if (!number(json, "mode", 2, &mode) || !number(json, "brightness", 100, &brightness) ||
+    if (!number(json, "mode", LIGHT_SPECTRUM, &mode) || !number(json, "brightness", 100, &brightness) ||
         !cJSON_IsString(color) || strlen(color->valuestring) != 7 || color->valuestring[0] != '#' ||
         strspn(color->valuestring + 1, "0123456789abcdefABCDEF") != 6) return false;
     next->rgb = strtoul(color->valuestring + 1, NULL, 16);
@@ -390,7 +414,10 @@ static esp_err_t settings_handler(httpd_req_t *req)
     body[used] = 0;
     cJSON *json = cJSON_ParseWithLengthOpts(body, used + 1, NULL, true);
     settings_t next = settings;
-    bool valid = cJSON_IsObject(json) && update_settings(req->uri, json, &next);
+    bool volume = !strcmp(req->uri, "/api/volume");
+    int limit = 0;
+    bool valid = cJSON_IsObject(json) && (volume ? number(json, "volumeLimit", 100, &limit) :
+                                                  update_settings(req->uri, json, &next));
     cJSON_Delete(json);
     if (!valid) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid settings");
 
@@ -399,7 +426,7 @@ static esp_err_t settings_handler(httpd_req_t *req)
         xSemaphoreGive(settings_write_lock);
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Restart pending");
     }
-    esp_err_t err = save_settings(&next);
+    esp_err_t err = volume ? volume_set_limit(limit) : save_settings(&next);
     if (err != ESP_OK) {
         xSemaphoreGive(settings_write_lock);
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "NVS write failed");
@@ -411,7 +438,7 @@ static esp_err_t settings_handler(httpd_req_t *req)
             return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Saved. Restart the device.");
         }
         restarting = true;
-    } else {
+    } else if (!volume) {
         audio_set_format((audio_format_t){settings.rate, settings.bits, 0});
         update_led();
     }
@@ -426,6 +453,7 @@ static httpd_handle_t web_start(void)
         { .uri = "/api/status", .method = HTTP_GET, .handler = status_handler },
         { .uri = "/api/wifi", .method = HTTP_POST, .handler = settings_handler },
         { .uri = "/api/audio", .method = HTTP_POST, .handler = settings_handler },
+        { .uri = "/api/volume", .method = HTTP_POST, .handler = settings_handler },
         { .uri = "/api/led", .method = HTTP_POST, .handler = settings_handler }
     };
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -447,6 +475,7 @@ void app_main(void)
 {
     ESP_ERROR_CHECK(nvs_flash_init());
     load_settings();
+    ESP_ERROR_CHECK(volume_init());
     settings_write_lock = xSemaphoreCreateMutex();
     ESP_ERROR_CHECK(settings_write_lock ? ESP_OK : ESP_ERR_NO_MEM);
     const gpio_config_t button = {
@@ -473,16 +502,21 @@ void app_main(void)
     err = dlna_start(server, device_name, mac, station, hotspot);
     if (err != ESP_OK) ESP_LOGE(TAG, "DLNA init: %s", esp_err_to_name(err));
 
-    const raop_config_t config = {
-        .device_name = device_name, .mac_address = mac, .mdns_hostname = hostname,
-        .audio_output_cb = airplay_audio, .event_cb = airplay_event,
-        .volume_mode = RAOP_VOLUME_SOFTWARE, .mdns_mode = RAOP_MDNS_MANAGED
+    const airplay2_config_t config = {
+        .name = device_name, .hostname = hostname,
+        .playback = airplay_playback, .flush = airplay_flush, .pcm = airplay_audio,
+        .get_volume = volume_airplay_get, .set_volume = volume_airplay_set, .save_volume = volume_save
     };
     if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) < 2 * 1024 * 1024) {
         ESP_LOGE(TAG, "AirPlay requires at least 2 MB of configured PSRAM");
         return;
     }
-    err = raop_init(&config, &raop);
+    // Let PTP join on the station interface when an existing network connects.
+    bool configured = settings.ssid[0] != 0;
+    for (unsigned i = 0; configured && i < 50 && !atomic_load(&station_connected); i++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    err = airplay2_start(&config);
     atomic_store(&airplay_available, err == ESP_OK);
     if (err != ESP_OK) ESP_LOGE(TAG, "AirPlay init: %s", esp_err_to_name(err));
 }

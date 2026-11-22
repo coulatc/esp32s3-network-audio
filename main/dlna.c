@@ -15,6 +15,7 @@
 #include "freertos/task.h"
 #include "lwip/sockets.h"
 #include "player.h"
+#include "volume.h"
 
 #define DEVICE_TYPE "urn:schemas-upnp-org:device:MediaRenderer:1"
 #define SERVICE_NS "urn:schemas-upnp-org:service:"
@@ -293,7 +294,7 @@ static unsigned rendering_action(const char *action, const char *body, char **re
     char value[24];
     if (!strcmp(action, "SelectPreset")) {
         if (!tag_value(body, "PresetName", value, sizeof(value)) || strcmp(value, "FactoryDefaults")) return 402;
-        player_set_volume(100);
+        player_set_volume(VOLUME_DEFAULT_DLNA);
         player_set_mute(false);
         return 0;
     }

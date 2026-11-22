@@ -26,7 +26,7 @@ input[type=color]{padding:4px}input[type=range]{padding:0;accent-color:var(--acc
 <div class="status">
 <span>局域网 <strong id="ip">—</strong></span>
 <span>投放来源 <strong id="source">—</strong></span>
-<span>AirPlay 1 <strong id="airplay">—</strong></span>
+<span>AirPlay 2 <strong id="airplay">—</strong></span>
 </div>
 <p id="offline" role="status"></p>
 </header>
@@ -53,16 +53,23 @@ input[type=color]{padding:4px}input[type=range]{padding:0;accent-color:var(--acc
 <button>应用输出格式</button>
 <p class="feedback" role="status"></p>
 </form>
+<form id="volume">
+<label class="field">音量上限 <output id="volume-limit-label" for="volume-limit"></output>
+<input id="volume-limit" name="volumeLimit" type="range" min="0" max="100" value="50"></label>
+<p class="hint">AirPlay 2 和 DLNA 共用此上限。设为 0% 可静音。</p>
+<button>保存音量上限</button>
+<p class="feedback" role="status"></p>
+</form>
 </section>
 <section class="card">
 <h2>GPIO48 · WS2812</h2>
 <form id="led">
 <div class="wide">
-<label class="field">模式<select name="mode"><option value="0">关闭</option><option value="1">常亮</option><option value="2">设备状态</option></select></label>
-<label class="field">颜色<input name="color" type="color" value="#18a8ff"></label>
+<label class="field">模式<select name="mode"><option value="0">关闭</option><option value="1">常亮</option><option value="2">设备状态</option><option value="3">音量亮度</option><option value="4">低频闪动</option><option value="5">三频变色</option></select></label>
+<label class="field">主色<input name="color" type="color" value="#18a8ff"></label>
 <label class="field">亮度 <output id="brightness-label"></output><input name="brightness" type="range" min="0" max="100" value="20"></label>
 </div>
-<button>应用灯光</button>
+<p class="hint">三频变色用红、绿、蓝分别显示低、中、高频。</p><button>应用灯光</button>
 <p class="feedback" role="status"></p>
 </form>
 </section>
@@ -70,9 +77,12 @@ input[type=color]{padding:4px}input[type=range]{padding:0;accent-color:var(--acc
 </main>
 <script>
 const $ = id => document.getElementById(id);
-const wifi = $('wifi'), audio = $('audio'), led = $('led');
+const wifi = $('wifi'), audio = $('audio'), volume = $('volume'), led = $('led');
+const volumeLimit = $('volume-limit'), volumeLimitLabel = $('volume-limit-label');
 const rate = $('rate'), bits = $('bits');
-let state, audioDirty = false, initial = true, restarting = false;
+function syncLightMode() { led.elements.color.disabled = Number(led.elements.mode.value) === 5; }
+led.elements.mode.addEventListener('change', syncLightMode);
+let state, audioDirty = false, volumeDirty = false, initial = true, restarting = false;
 function options(select, values, selected, label) {
   select.replaceChildren(...values.map(value => new Option(label(value), String(value))));
   if (values.includes(selected)) select.value = String(selected);
@@ -106,10 +116,17 @@ function render(data) {
     initial = false;
   }
   $('brightness-label').textContent = led.elements.brightness.value + '%';
+  if (!volumeDirty) volumeLimit.value = data.volumeLimit;
+  volumeLimitLabel.textContent = volumeLimit.value + '%';
+  syncLightMode();
   formats(audioDirty ? selectedRate : data.rate, audioDirty ? selectedBits : data.bits);
 }
 rate.addEventListener('change', () => { audioDirty = true; formats(Number(rate.value), Number(bits.value)); });
 bits.addEventListener('change', () => { audioDirty = true; });
+volumeLimit.addEventListener('input', () => {
+  volumeDirty = true;
+  volumeLimitLabel.textContent = volumeLimit.value + '%';
+});
 led.elements.brightness.addEventListener('input', () => {
   $('brightness-label').textContent = led.elements.brightness.value + '%';
 });
@@ -158,6 +175,10 @@ submit(wifi, () => ({ssid:wifi.elements.ssid.value,password:wifi.elements.passwo
 submit(audio, () => ({rate:Number(rate.value),bits:Number(bits.value)}), () => {
   audioDirty = false;
   return '已保存。实际输出格式将在上方更新。';
+});
+submit(volume, () => ({volumeLimit:Number(volumeLimit.value)}), result => {
+  volumeDirty = false;
+  return '音量上限已保存为 ' + result.volumeLimit + '%。';
 });
 submit(led, () => ({mode:Number(led.elements.mode.value),color:led.elements.color.value,
   brightness:Number(led.elements.brightness.value)}), () => '灯光设置已应用。');

@@ -276,6 +276,7 @@ cleanup:
   slot->socket = -1;
 
   // Immediate: stop audio and NTP
+  ptp_clock_remove_peer(conn);
   audio_receiver_stop();
   if (!slot->is_old) {
     // The socket is gone, so the claim on the audio path goes with it. The DACP

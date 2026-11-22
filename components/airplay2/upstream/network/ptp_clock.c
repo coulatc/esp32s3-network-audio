@@ -10,6 +10,7 @@
 #include <unistd.h>
 
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,14 +28,39 @@ static const char *TAG = "ptp_clock";
 // PTP message types
 #define PTP_MSG_SYNC       0x0
 #define PTP_MSG_DELAY_REQ  0x1
+#define PTP_MSG_PDELAY_REQ 0x2
+#define PTP_MSG_PDELAY_RESP 0x3
 #define PTP_MSG_FOLLOW_UP  0x8
 #define PTP_MSG_DELAY_RESP 0x9
+#define PTP_MSG_PDELAY_FOLLOW_UP 0xA
 #define PTP_MSG_ANNOUNCE   0xB
 
 // PTP header size and timestamp offset
 #define PTP_HEADER_SIZE      34
 #define PTP_TIMESTAMP_OFFSET 34
 #define PTP_TIMESTAMP_SIZE   10
+
+enum {
+  PTP_FALLBACK_PRIORITY = 249,
+  PTP_ANNOUNCE_DATASET_SIZE = 64,
+  PTP_SYNC_PERIOD_US = 125000,
+  PTP_ANNOUNCE_PERIOD_US = 1000000,
+  PTP_UNICAST = 0x04,
+  PTP_TWO_STEP = 0x02,
+  PTP_TIMESCALE = 0x08,
+};
+
+typedef struct {
+  const void *session;
+  uint32_t address;
+  uint8_t profile;
+  uint8_t domain;
+  bool serving;
+} ptp_peer_t;
+
+static uint64_t local_clock_id;
+static ptp_peer_t timing_peer;
+static void clear_clock_state(void);
 
 // Synchronization parameters
 //
@@ -150,6 +176,31 @@ static struct {
 // coherent transition. Only clock state and bounded packet parsing belong
 // under this mux; logs, sockets and task lifecycle operations stay outside.
 static portMUX_TYPE ptp_state_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static ptp_peer_t snapshot_peer(void) {
+  portENTER_CRITICAL(&ptp_state_mux);
+  ptp_peer_t peer = timing_peer;
+  portEXIT_CRITICAL(&ptp_state_mux);
+  return peer;
+}
+
+void ptp_clock_set_peer(const void *session, uint32_t address) {
+  portENTER_CRITICAL(&ptp_state_mux);
+  if (session != timing_peer.session || address != timing_peer.address) {
+    if (timing_peer.serving) clear_clock_state();
+    timing_peer = (ptp_peer_t){.session = session, .address = address};
+  }
+  portEXIT_CRITICAL(&ptp_state_mux);
+}
+
+void ptp_clock_remove_peer(const void *session) {
+  portENTER_CRITICAL(&ptp_state_mux);
+  if (session && session == timing_peer.session) {
+    if (timing_peer.serving) clear_clock_state();
+    timing_peer = (ptp_peer_t){0};
+  }
+  portEXIT_CRITICAL(&ptp_state_mux);
+}
 
 typedef struct {
   bool stepped;
@@ -427,14 +478,15 @@ static void process_followup(const uint8_t *data, size_t len, uint16_t seq,
 
 // Process received PTP message
 static void process_ptp_message(const uint8_t *data, size_t len,
-                                bool is_event_port) {
-  if (len < PTP_HEADER_SIZE) {
+                                bool is_event_port, uint32_t sender) {
+  if (len < PTP_HEADER_SIZE || (data[1] & 0x0F) != 2) {
     return;
   }
 
   uint8_t msg_type = data[0] & 0x0F;
   uint16_t seq = ((uint16_t)data[30] << 8) | data[31];
   ptp_update_log_t log = {0};
+  bool began_serving = false;
 
   portENTER_CRITICAL(&ptp_state_mux);
   // If a master filter is set, reject messages from other clocks.
@@ -465,14 +517,125 @@ static void process_ptp_message(const uint8_t *data, size_t len,
 
   case PTP_MSG_ANNOUNCE:
     ptp.announce_count++;
-    // Could track master identity here if needed
+    if (!is_event_port && sender == timing_peer.address && timing_peer.session &&
+        len >= PTP_ANNOUNCE_DATASET_SIZE && parse_ptp_clock_id(data) != local_clock_id) {
+      // A normal sender (including iOS) offers a better clock. Only serve
+      // our clock to a session peer that explicitly yields in its Announce.
+      bool yields = data[47] > PTP_FALLBACK_PRIORITY;
+      began_serving = yields && !timing_peer.serving;
+      if (timing_peer.serving && !yields && ptp.expected_clock_id == local_clock_id) {
+        clear_clock_state();
+      }
+      timing_peer.serving = yields;
+      timing_peer.profile = data[0] & 0xF0;
+      timing_peer.domain = data[4];
+    }
     break;
 
   default:
     break;
   }
   portEXIT_CRITICAL(&ptp_state_mux);
+  if (began_serving) {
+    ESP_LOGI(TAG, "Serving unicast PTP clock %016llx for session peer",
+             (unsigned long long)local_clock_id);
+  }
   log_offset_update(&log);
+}
+
+static void put_be(uint8_t *out, size_t bytes, uint64_t value) {
+  while (bytes) {
+    out[--bytes] = (uint8_t)value;
+    value >>= 8;
+  }
+}
+
+static void put_timestamp(uint8_t *out, uint64_t ns) {
+  put_be(out, 6, ns / 1000000000ULL);
+  put_be(out + 6, 4, ns % 1000000000ULL);
+}
+
+static void put_header(uint8_t *out, size_t size, const ptp_peer_t *peer,
+                       uint8_t type, uint16_t seq, bool two_step, uint8_t control,
+                       int8_t log_interval) {
+  memset(out, 0, size);
+  out[0] = peer->profile | type;
+  out[1] = 2;
+  put_be(out + 2, 2, size);
+  out[4] = peer->domain;
+  out[6] = PTP_UNICAST | (two_step ? PTP_TWO_STEP : 0);
+  out[7] = PTP_TIMESCALE;
+  put_be(out + 20, 8, local_clock_id);
+  out[29] = 1;
+  put_be(out + 30, 2, seq);
+  out[32] = control;
+  out[33] = (uint8_t)log_interval;
+}
+
+static void send_unicast(int sock, uint16_t port, const ptp_peer_t *peer,
+                         const uint8_t *packet, size_t size) {
+  struct sockaddr_in to = {.sin_family = AF_INET, .sin_port = htons(port),
+                           .sin_addr.s_addr = peer->address};
+  sendto(sock, packet, size, 0, (struct sockaddr *)&to, sizeof(to));
+}
+
+static void send_announce(const ptp_peer_t *peer, uint16_t seq) {
+  uint8_t packet[76];
+  put_header(packet, sizeof(packet), peer, PTP_MSG_ANNOUNCE, seq, false, 5, 0);
+  packet[47] = PTP_FALLBACK_PRIORITY;
+  packet[48] = 248; // Free-running local oscillator.
+  packet[49] = 0xFE;
+  put_be(packet + 50, 2, 0xFFFF);
+  packet[52] = 248;
+  put_be(packet + 53, 8, local_clock_id);
+  packet[63] = 0xA0; // INTERNAL_OSCILLATOR.
+  put_be(packet + 64, 2, 0x0008); // PATH_TRACE TLV.
+  put_be(packet + 66, 2, 8);
+  put_be(packet + 68, 8, local_clock_id);
+  send_unicast(ptp.general_socket, PTP_GENERAL_PORT, peer, packet, sizeof(packet));
+}
+
+static void send_sync(const ptp_peer_t *peer, uint16_t seq) {
+  uint8_t sync[44];
+  uint8_t followup[96];
+  put_header(sync, sizeof(sync), peer, PTP_MSG_SYNC, seq, true, 0, -3);
+  uint64_t egress_ns = get_local_time_ns();
+  send_unicast(ptp.event_socket, PTP_EVENT_PORT, peer, sync, sizeof(sync));
+
+  put_header(followup, sizeof(followup), peer, PTP_MSG_FOLLOW_UP, seq, false, 2, -3);
+  put_timestamp(followup + PTP_HEADER_SIZE, egress_ns);
+  // 802.1AS Follow_Up Information and the AirPlay clock identity extension.
+  const uint8_t gptp_info[] = {0, 3, 0, 28, 0, 0x80, 0xC2, 0, 0, 1};
+  const uint8_t clock_info[] = {0, 3, 0, 16, 0, 0x0D, 0x93, 0, 0, 4};
+  memcpy(followup + 44, gptp_info, sizeof(gptp_info));
+  memcpy(followup + 76, clock_info, sizeof(clock_info));
+  put_be(followup + 86, 8, local_clock_id);
+  send_unicast(ptp.general_socket, PTP_GENERAL_PORT, peer, followup, sizeof(followup));
+}
+
+static void respond_to_delay(const uint8_t *request, size_t len, uint32_t sender,
+                             uint64_t received_ns) {
+  if (len < PTP_HEADER_SIZE + PTP_TIMESTAMP_SIZE || (request[1] & 0x0F) != 2) return;
+  uint8_t type = request[0] & 0x0F;
+  if (type != PTP_MSG_DELAY_REQ && type != PTP_MSG_PDELAY_REQ) return;
+  ptp_peer_t peer = snapshot_peer();
+  if (!peer.serving || sender != peer.address || request[4] != peer.domain) return;
+
+  uint8_t reply[54];
+  uint16_t seq = (uint16_t)request[30] << 8 | request[31];
+  bool pdelay = type == PTP_MSG_PDELAY_REQ;
+  put_header(reply, sizeof(reply), &peer,
+             pdelay ? PTP_MSG_PDELAY_RESP : PTP_MSG_DELAY_RESP, seq, pdelay,
+             pdelay ? 5 : 3, 0x7F);
+  put_timestamp(reply + 34, received_ns);
+  memcpy(reply + 44, request + 20, 10);
+  if (pdelay) {
+    send_unicast(ptp.event_socket, PTP_EVENT_PORT, &peer, reply, sizeof(reply));
+    put_header(reply, sizeof(reply), &peer, PTP_MSG_PDELAY_FOLLOW_UP, seq, false, 5, 0x7F);
+    put_timestamp(reply + 34, get_local_time_ns());
+    memcpy(reply + 44, request + 20, 10);
+  }
+  send_unicast(ptp.general_socket, PTP_GENERAL_PORT, &peer, reply, sizeof(reply));
 }
 
 // Create and bind multicast socket
@@ -519,8 +682,21 @@ static int create_ptp_socket(uint16_t port) {
 }
 
 // PTP task - listens for messages on both ports
+static void receive_ptp(int sock, uint8_t *buffer, size_t capacity, bool event) {
+  struct sockaddr_in sender = {0};
+  socklen_t size = sizeof(sender);
+  ssize_t len = recvfrom(sock, buffer, capacity, 0, (struct sockaddr *)&sender, &size);
+  if (len <= 0) return;
+  uint64_t received_ns = get_local_time_ns();
+  process_ptp_message(buffer, (size_t)len, event, sender.sin_addr.s_addr);
+  if (event) respond_to_delay(buffer, (size_t)len, sender.sin_addr.s_addr, received_ns);
+}
+
 static void ptp_task(void *pvParameters) {
   uint8_t buffer[256];
+  uint16_t sync_seq = 0, announce_seq = 0;
+  int64_t next_sync = 0, next_announce = 0;
+  const void *serving_session = NULL;
 
   while (ptp.running) {
     fd_set read_fds;
@@ -545,7 +721,26 @@ static void ptp_task(void *pvParameters) {
       continue;
     }
 
-    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    ptp_peer_t peer = snapshot_peer();
+    if (peer.serving) {
+      if (serving_session != peer.session) {
+        serving_session = peer.session;
+        next_sync = next_announce = 0;
+      }
+      int64_t now = esp_timer_get_time();
+      if (now >= next_announce) {
+        send_announce(&peer, ++announce_seq);
+        next_announce = now + PTP_ANNOUNCE_PERIOD_US;
+      }
+      if (now >= next_sync) {
+        send_sync(&peer, ++sync_seq);
+        next_sync = now + PTP_SYNC_PERIOD_US;
+      }
+    } else {
+      serving_session = NULL;
+    }
+    struct timeval tv = peer.serving ? (struct timeval){.tv_usec = PTP_SYNC_PERIOD_US} :
+                                      (struct timeval){.tv_sec = 1};
     int ret = select(max_fd + 1, &read_fds, NULL, NULL, &tv);
 
     if (ret < 0) {
@@ -558,23 +753,15 @@ static void ptp_task(void *pvParameters) {
       continue;
     }
 
-    if (ret == 0) {
-      // Timeout - check if we lost lock due to no messages
-    } else {
+    if (ret > 0) {
       // Check event port (SYNC messages)
       if (ptp.event_socket >= 0 && FD_ISSET(ptp.event_socket, &read_fds)) {
-        ssize_t len = recv(ptp.event_socket, buffer, sizeof(buffer), 0);
-        if (len > 0) {
-          process_ptp_message(buffer, (size_t)len, true);
-        }
+        receive_ptp(ptp.event_socket, buffer, sizeof(buffer), true);
       }
 
       // Check general port (FOLLOW_UP messages)
       if (ptp.general_socket >= 0 && FD_ISSET(ptp.general_socket, &read_fds)) {
-        ssize_t len = recv(ptp.general_socket, buffer, sizeof(buffer), 0);
-        if (len > 0) {
-          process_ptp_message(buffer, (size_t)len, false);
-        }
+        receive_ptp(ptp.general_socket, buffer, sizeof(buffer), false);
       }
     }
   }
@@ -598,8 +785,16 @@ esp_err_t ptp_clock_init(void) {
     return ESP_ERR_INVALID_STATE;
   }
 
+  uint8_t mac[6];
+  esp_err_t err = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  if (err != ESP_OK) return err;
+  uint64_t identity = (uint64_t)mac[0] << 56 | (uint64_t)mac[1] << 48 |
+                      (uint64_t)mac[2] << 40 | UINT64_C(0xFFFE) << 24 |
+                      (uint64_t)mac[3] << 16 | (uint64_t)mac[4] << 8 | mac[5];
   portENTER_CRITICAL(&ptp_state_mux);
   memset(&ptp, 0, sizeof(ptp));
+  local_clock_id = identity;
+  timing_peer = (ptp_peer_t){0};
   portEXIT_CRITICAL(&ptp_state_mux);
   ptp.event_socket = -1;
   ptp.general_socket = -1;
@@ -759,7 +954,7 @@ bool ptp_clock_is_locked(void) {
     }
   }
 
-  bool locked = ptp.locked;
+  bool locked = ptp.locked || (timing_peer.serving && ptp.expected_clock_id == local_clock_id);
   portEXIT_CRITICAL(&ptp_state_mux);
   return locked;
 }
@@ -771,7 +966,8 @@ uint64_t ptp_clock_get_time_ns(void) {
 
 int64_t ptp_clock_get_offset_ns(void) {
   portENTER_CRITICAL(&ptp_state_mux);
-  int64_t offset = ptp.filtered_offset_ns;
+  int64_t offset = timing_peer.serving && ptp.expected_clock_id == local_clock_id ? 0 :
+                   ptp.filtered_offset_ns;
   portEXIT_CRITICAL(&ptp_state_mux);
   return offset;
 }

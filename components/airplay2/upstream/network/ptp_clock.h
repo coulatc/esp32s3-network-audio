@@ -8,8 +8,8 @@
 #include "esp_err.h"
 
 /**
- * Simple PTP (IEEE 1588) slave for AirPlay time synchronization.
- * Listens for SYNC/FOLLOW_UP messages and tracks offset to PTP master.
+ * PTP time synchronization for AirPlay. Follows the sender by default and
+ * can serve a clock to a connected sender that yields in BMCA.
  */
 
 /**
@@ -22,6 +22,12 @@ esp_err_t ptp_clock_init(void);
  * Stop PTP clock and free resources.
  */
 void ptp_clock_stop(void);
+
+/** Register the IPv4 address of an authenticated AirPlay 2 PTP session. */
+void ptp_clock_set_peer(const void *session, uint32_t address);
+
+/** Remove that session's peer without affecting a replacement session. */
+void ptp_clock_remove_peer(const void *session);
 
 /**
  * Clear PTP clock synchronization state.

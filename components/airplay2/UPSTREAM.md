@@ -9,3 +9,5 @@ reports initialization errors to the application. The RTSP server registers
 the L16 codec and starts NTP timing for senders that select it in AirPlay 2
 SETUP. The NTP client samples more frequently until it locks. RTSP reports
 the effective playback volume from the application's USB output settings.
+For AirPlay 2 senders that yield in PTP clock selection, the receiver also
+serves its local clock by unicast to the authenticated session peer.

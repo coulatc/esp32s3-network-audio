@@ -1274,9 +1274,13 @@ static void handle_setup(int socket, rtsp_conn_t *conn,
     if (is_bplist) {
       char timing_protocol[8];
       int64_t timing_port;
-      if (bplist_find_string(body, body_len, "timingProtocol", timing_protocol,
-                             sizeof(timing_protocol)) &&
-          strcmp(timing_protocol, "NTP") == 0 &&
+      bool has_timing = bplist_find_string(body, body_len, "timingProtocol", timing_protocol,
+                                          sizeof(timing_protocol));
+      if (has_timing && strcmp(timing_protocol, "PTP") == 0 && conn->encrypted_mode) {
+        conn->protocol_version = 2;
+        ptp_clock_set_peer(conn, conn->client_ip);
+      }
+      if (has_timing && strcmp(timing_protocol, "NTP") == 0 &&
           bplist_find_int(body, body_len, "timingPort", &timing_port) &&
           timing_port > 0 && timing_port <= UINT16_MAX) {
         conn->protocol_version = 2;
@@ -1925,6 +1929,7 @@ static void handle_teardown(int socket, rtsp_conn_t *conn,
       has_streams; // Keep session ready if only streams torn down
 
   if (!has_streams) {
+    ptp_clock_remove_peer(conn);
     // Full teardown — server cleanup will emit PLAYBACK_EVENT_DISCONNECTED
     // when the TCP connection closes.
     // Release the audio path now rather than behind the grace period below:

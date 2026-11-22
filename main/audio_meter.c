@@ -54,14 +54,12 @@ void audio_meter_feed(const uint8_t *pcm, size_t size, unsigned rate, unsigned s
         atomic_store(&packed_levels, 0);
     }
 
-    for (size_t index = 0; index + slot * 2 <= size; index += slot * 2) {
-        if (meter.until_sample) {
-            meter.until_sample--;
-            continue;
-        }
-        meter.until_sample = meter.step - 1;
+    const unsigned frame_bytes = slot * 2;
+    const unsigned frames = size / frame_bytes;
+    unsigned frame = meter.until_sample;
+    for (; frame < frames; frame += meter.step) {
         for (unsigned ch = 0; ch < 2; ch++) {
-            int32_t sample = signed_sample(pcm + index + ch * slot, slot);
+            int32_t sample = signed_sample(pcm + frame * frame_bytes + ch * slot, slot);
             meter.bass[ch] += (sample - meter.bass[ch]) * meter.alpha_bass / 32768;
             meter.bass_mid[ch] += (sample - meter.bass_mid[ch]) * meter.alpha_bass_mid / 32768;
             meter.sums[0] += magnitude(sample);
@@ -80,6 +78,7 @@ void audio_meter_feed(const uint8_t *pcm, size_t size, unsigned rate, unsigned s
             meter.samples = 0;
         }
     }
+    meter.until_sample = frame - frames;
 }
 
 audio_meter_t audio_meter_read(uint32_t now_ms)

@@ -15,6 +15,10 @@
 
 #define OUTPUT_PACKET_MAX 600
 #define PCM_BLOCK_SIZE 768
+#define PCM_QUEUE_BLOCKS 10
+#define UAC2_RING_BYTES 6144
+#define UAC1_RING_BYTES 8192
+#define USB_WRITER_CORE 0
 #define MAX_FORMATS 48
 #define GAIN_RAMP_MS 180
 #define GAIN_RAMP_SHIFT 8
@@ -27,6 +31,7 @@ typedef struct {
 
 typedef struct {
     uint32_t generation;
+    uint32_t queued_at_us;
     audio_source_t source;
     size_t length;
     uint8_t data[PCM_BLOCK_SIZE];
@@ -38,6 +43,7 @@ static const uint32_t rates[] = {44100, 48000, 32000, 88200, 96000, 24000, 22050
 static QueueHandle_t connections, pcm_queue;
 static SemaphoreHandle_t lock;
 static atomic_uint generation = 1, active_encoding, written_bytes, written_gain;
+static atomic_uint usb_path_us, usb_underrun_bytes, usb_write_errors, pcm_queue_drops;
 static atomic_int owner = -1;
 static atomic_bool detached, stream_failed;
 static audio_format_t preferred, supported[MAX_FORMATS];
@@ -48,8 +54,9 @@ static const char *message = "等待 USB DAC";
 static int32_t read_sample(const uint8_t *at, unsigned bytes)
 {
     // PCM is little-endian; align samples to the most significant bits.
-    uint32_t value = 0;
-    for (unsigned i = 0; i < bytes; i++) value |= (uint32_t)at[i] << (8 * (i + 4 - bytes));
+    uint32_t value = (uint32_t)at[bytes - 1] << 24 | (uint32_t)at[bytes - 2] << 16;
+    if (bytes >= 3) value |= (uint32_t)at[bytes - 3] << 8;
+    if (bytes == 4) value |= at[0];
     return (int32_t)value;
 }
 
@@ -57,18 +64,25 @@ static void write_sample(uint8_t *at, int32_t sample, audio_format_t format)
 {
     uint32_t mask = UINT32_MAX << (32 - format.bits);
     uint32_t packed = ((uint32_t)sample & mask) >> (32 - format.bytes * 8);
-    for (unsigned b = 0; b < format.bytes; b++) at[b] = packed >> (8 * b);
+    at[0] = packed;
+    at[1] = packed >> 8;
+    if (format.bytes >= 3) at[2] = packed >> 16;
+    if (format.bytes == 4) at[3] = packed >> 24;
 }
 
 static unsigned limit_block(pcm_block_t *block, audio_format_t format, unsigned current)
 {
     unsigned target = volume_gain(block->source) << GAIN_RAMP_SHIFT;
     if (current > target) current = target;
+    if (!target) {
+        memset(block->data, 0, block->length);
+        return 0;
+    }
     if (current == (VOLUME_UNITY << GAIN_RAMP_SHIFT)) return current;
     if (!format.bits) format.bits = 32;
 
     // Start new audio from zero and ramp increases. Apply decreases on the next block.
-    unsigned step = ((uint64_t)VOLUME_UNITY << GAIN_RAMP_SHIFT) * 1000 / (format.rate * GAIN_RAMP_MS);
+    unsigned step = (VOLUME_UNITY << GAIN_RAMP_SHIFT) * 100 / (format.rate * (GAIN_RAMP_MS / 10));
     unsigned stride = format.bytes * 2;
     for (size_t i = 0; i < block->length; i += stride) {
         if (target - current < step) current = target;
@@ -252,7 +266,7 @@ static void process_device(connection_t connection)
     if (connection.protocol == UAC2) {
         uac2_host_device_config_t config = {
             .addr = connection.address, .iface_num = connection.interface,
-            .buffer_size = 8192, .callback = uac2_event
+            .buffer_size = UAC2_RING_BYTES, .callback = uac2_event
         };
         err = uac2_host_device_open(&config, &two);
         if (err != ESP_OK) goto open_failed;
@@ -260,7 +274,7 @@ static void process_device(connection_t connection)
     } else {
         uac_host_device_config_t config = {
             .addr = connection.address, .iface_num = connection.interface,
-            .buffer_size = 8192, .callback = uac1_event
+            .buffer_size = UAC1_RING_BYTES, .callback = uac1_event
         };
         err = uac_host_device_open(&config, &one);
         if (err != ESP_OK) goto open_failed;
@@ -274,6 +288,7 @@ static void process_device(connection_t connection)
     uint32_t output_generation = 0;
     unsigned current_gain = 0;
     bool reported_pcm = false;
+    int64_t next_usb_sample = 0;
     while (!atomic_load(&detached)) {
         xSemaphoreTake(lock, portMAX_DELAY);
         audio_format_t target = preferred;
@@ -331,6 +346,7 @@ static void process_device(connection_t connection)
             esp_err_t wrote = two ? uac2_host_device_write(two, block.data, block.length, 40) :
                                     uac_host_device_write(one, block.data, block.length, 40);
             if (wrote == ESP_OK) {
+                int64_t now = esp_timer_get_time();
                 atomic_fetch_add(&written_bytes, block.length);
                 atomic_store(&written_gain, current_gain >> GAIN_RAMP_SHIFT);
                 if (!reported_pcm && block.generation == atomic_load(&generation)) {
@@ -338,7 +354,19 @@ static void process_device(connection_t connection)
                     reported_pcm = true;
                 }
                 audio_meter_feed(block.data, block.length, format.rate, format.bytes,
-                                 block.generation, esp_timer_get_time() / 1000);
+                                 block.generation, now / 1000);
+                if (two && now >= next_usb_sample) {
+                    next_usb_sample = now + 50000;
+                    uac2_host_buffer_status_t buf;
+                    if (uac2_host_device_get_buffer_status(two, &buf) == ESP_OK) {
+                        uint32_t duration = (uint64_t)block.length * 1000000 / (format.rate * format.bytes * 2);
+                        uint32_t ahead = buf.ring_us > duration ? buf.ring_us - duration : 0;
+                        atomic_store(&usb_path_us, (uint32_t)now - block.queued_at_us + ahead + buf.in_flight_us);
+                        atomic_store(&usb_underrun_bytes, buf.underrun_bytes);
+                    }
+                }
+            } else {
+                atomic_fetch_add(&usb_write_errors, 1);
             }
         }
     }
@@ -375,7 +403,7 @@ esp_err_t audio_init(audio_format_t initial)
     preferred = initial;
     lock = xSemaphoreCreateMutex();
     connections = xQueueCreate(8, sizeof(connection_t));
-    pcm_queue = xQueueCreate(20, sizeof(pcm_block_t));
+    pcm_queue = xQueueCreate(PCM_QUEUE_BLOCKS, sizeof(pcm_block_t));
     if (!lock || !connections || !pcm_queue) return ESP_ERR_NO_MEM;
 
     const usb_host_config_t host = { .intr_flags = ESP_INTR_FLAG_LEVEL1 };
@@ -398,7 +426,8 @@ esp_err_t audio_init(audio_format_t initial)
     if (uac2_err != ESP_OK) ESP_LOGE(TAG, "UAC2 install: %s", esp_err_to_name(uac2_err));
     if (uac1_err != ESP_OK) ESP_LOGE(TAG, "UAC1 install: %s", esp_err_to_name(uac1_err));
     if (uac1_err != ESP_OK && uac2_err != ESP_OK) return uac2_err;
-    return xTaskCreate(audio_task, "usb_audio", 6144, NULL, 10, NULL) == pdPASS ?
+    return xTaskCreatePinnedToCore(audio_task, "usb_audio", 6144, NULL, 10, NULL,
+                                   USB_WRITER_CORE) == pdPASS ?
         ESP_OK : ESP_ERR_NO_MEM;
 }
 
@@ -455,12 +484,16 @@ void audio_release(audio_source_t source)
 
 static bool queue_block(audio_source_t source, pcm_block_t *block)
 {
-    TickType_t wait = source == AUDIO_DLNA ? pdMS_TO_TICKS(75) : 0;
+    // The renderer produces 256 frames at a time. Give the independent USB
+    // writer a brief chance to drain a full queue without waiting a full block.
+    TickType_t wait = pdMS_TO_TICKS(source == AUDIO_DLNA ? 75 : 3);
     if (!audio_is_owner(source) || block->generation != atomic_load(&generation)) return false;
+    block->queued_at_us = (uint32_t)esp_timer_get_time();
     if (xQueueSend(pcm_queue, block, wait) == pdTRUE) {
         block->length = 0;
         return true;
     }
+    atomic_fetch_add(&pcm_queue_drops, 1);
     return false;
 }
 
@@ -476,12 +509,25 @@ bool audio_write(audio_source_t source, audio_resampler_t *state, const uint8_t 
     if (state->generation != current_gen || state->input_rate != input_rate ||
         state->output_rate != out.rate) {
         *state = (audio_resampler_t){ .generation = current_gen, .input_rate = input_rate,
-                                     .output_rate = out.rate };
+                                     .output_rate = out.rate,
+                                     .phase_scale = ((UINT64_C(1) << 47) + out.rate / 2) / out.rate };
     }
 
     unsigned input_slot = bits / 8, stride = input_slot * channels;
     unsigned output_stride = out.bytes * 2;
     pcm_block_t block = { .generation = current_gen, .source = source };
+    if (input_rate == out.rate && channels == 2 && bits == out.bits && input_slot == out.bytes) {
+        length -= length % stride;
+        while (length) {
+            size_t n = length < sizeof(block.data) ? length : sizeof(block.data);
+            memcpy(block.data, pcm, n);
+            block.length = n;
+            if (!queue_block(source, &block)) return false;
+            pcm += n;
+            length -= n;
+        }
+        return true;
+    }
     for (size_t pos = 0; pos + stride <= length; pos += stride) {
         int32_t sample[2];
         sample[0] = read_sample(pcm + pos, input_slot);
@@ -492,9 +538,14 @@ bool audio_write(audio_source_t source, audio_resampler_t *state, const uint8_t 
             state->primed = true;
         }
         while (state->phase <= out.rate) {
+            // Q31 interpolation with one shared weight for both channels. The
+            // reciprocal is computed only when the rates or stream change.
+            bool at_sample = state->phase == out.rate;
+            uint32_t fraction = at_sample ? 0 : (state->phase * state->phase_scale + (1U << 15)) >> 16;
             for (unsigned ch = 0; ch < 2; ch++) {
                 int64_t delta = (int64_t)sample[ch] - state->previous[ch];
-                int32_t result = state->previous[ch] + delta * state->phase / out.rate;
+                int32_t result = at_sample ? sample[ch] :
+                    state->previous[ch] + ((delta * fraction) >> 31);
                 write_sample(block.data + block.length, result, out);
                 block.length += out.bytes;
             }
@@ -511,6 +562,31 @@ bool audio_write(audio_source_t source, audio_resampler_t *state, const uint8_t 
     return !block.length || queue_block(source, &block);
 }
 
+static void cpu_load_status(cJSON *status)
+{
+#if CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS && !CONFIG_FREERTOS_SMP && !CONFIG_FREERTOS_UNICORE
+    // Status requests are serialized by the HTTP server.
+    static int64_t last_sample;
+    static uint64_t previous_idle[2];
+    static unsigned load[2];
+    int64_t now = esp_timer_get_time();
+    if (now - last_sample >= 500000) {
+        uint64_t span = now - last_sample;
+        for (int core = 0; core < 2; core++) {
+            uint64_t idle = ulTaskGetIdleRunTimeCounterForCore(core);
+            uint64_t elapsed_idle = idle - previous_idle[core];
+            load[core] = elapsed_idle >= span ? 0 : (span - elapsed_idle) * 100 / span;
+            previous_idle[core] = idle;
+        }
+        last_sample = now;
+    }
+    cJSON_AddNumberToObject(status, "cpu0Load", load[0]);
+    cJSON_AddNumberToObject(status, "cpu1Load", load[1]);
+#else
+    (void)status;
+#endif
+}
+
 void audio_status(cJSON *status)
 {
     cJSON *options = cJSON_AddArrayToObject(status, "formats");
@@ -519,6 +595,12 @@ void audio_status(cJSON *status)
     cJSON_AddStringToObject(status, "usb", message);
     cJSON_AddNumberToObject(status, "uac", active_class);
     cJSON_AddNumberToObject(status, "usbBytesWritten", atomic_load(&written_bytes));
+    cJSON_AddNumberToObject(status, "usbWriteErrors", atomic_load(&usb_write_errors));
+    cJSON_AddNumberToObject(status, "pcmQueueDrops", atomic_load(&pcm_queue_drops));
+    if (audio_ready() && active_class == UAC2 && atomic_load(&owner) >= 0) {
+        cJSON_AddNumberToObject(status, "usbPathUs", atomic_load(&usb_path_us));
+        cJSON_AddNumberToObject(status, "usbUnderrunBytes", atomic_load(&usb_underrun_bytes));
+    }
     double gain = audio_ready() && atomic_load(&owner) >= 0 ? atomic_load(&written_gain) : 0;
     cJSON_AddNumberToObject(status, "usbVolumePercent", gain * 100 / VOLUME_UNITY);
     audio_format_t active = decode_format(atomic_load(&active_encoding));
@@ -532,4 +614,5 @@ void audio_status(cJSON *status)
         cJSON_AddItemToArray(options, entry);
     }
     xSemaphoreGive(lock);
+    cpu_load_status(status);
 }

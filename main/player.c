@@ -247,7 +247,8 @@ static void player_task(void *unused)
 esp_err_t player_init(void)
 {
     lock = xSemaphoreCreateMutex();
-    if (!lock || xTaskCreate(player_task, "dlna_media", 14336, NULL, 5, &task) != pdPASS) {
+    if (!lock || xTaskCreatePinnedToCore(player_task, "dlna_media", 14336, NULL, 5, &task,
+                                         portNUM_PROCESSORS - 1) != pdPASS) {
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;

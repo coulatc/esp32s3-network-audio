@@ -50,6 +50,8 @@ python -m esptool --chip esp32s3 -p COM7 -b 460800 write-flash --flash-mode dio 
 
 GPIO48 连接一颗 GRB 顺序的 WS2812。原生 USB OTG 口继续作为主机接 CX31993，下载和监控走独立串口。固件分区保留此前的 NVS 位置，更新时使用正常烧录命令可以保留原有配网和输出偏好。
 
+USB 写入任务与 USB Host 运行在 CPU0，DLNA 解码和 AirPlay 实时渲染在 CPU1。UAC2 使用较浅的 PCM 队列和 USB 缓冲。`/api/status` 提供最近采样的 `cpu0Load`、`cpu1Load`，以及 UAC2 播放时估算的 PCM 入队至 USB 总线延迟 `usbPathUs`。这个数值不包含发送端缓冲、网络传输或 DAC 的模拟输出延迟。
+
 ## 上游组件
 
 - [rbouteiller/airplay-esp32](https://github.com/rbouteiller/airplay-esp32/tree/35be6fcb58f7224a50b9f8500482fa8a2a989307) 提供 AirPlay 2 协议、配对和播放调度。上游说明及许可位于 `components/airplay2/`。

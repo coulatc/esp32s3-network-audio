@@ -19,6 +19,7 @@ typedef struct {
     unsigned input_rate;
     unsigned output_rate;
     unsigned phase;
+    uint64_t phase_scale;
     int32_t previous[2];
     bool primed;
 } audio_resampler_t;

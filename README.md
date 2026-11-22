@@ -6,7 +6,7 @@
 
 1. DAC 接开发板的原生 USB OTG 口，烧录和串口日志用独立的 UART/USB 转串口连接。OTG 接口需要能在主机模式下给 DAC 提供 5 V VBUS。
 2. 连接热点 `S3-Audio-XXXXXX`，密码 `S3audio-setup`，在浏览器打开 `http://192.168.4.1/`。名称中的 XXXXXX 来自本板 Wi-Fi MAC 的末六位。
-3. 在网页保存家里或工作室的 **2.4 GHz Wi-Fi**。板子重启，连上 Wi-Fi 并取得 IP 后会关闭配置热点。把手机或电脑接入同一局域网，访问串口日志显示的 `http://<设备IP>/`，或尝试 `http://s3-audio-xxxxxx.local/`。连不上已保存的 Wi-Fi 时，板子会继续开放配置热点。
+3. 在网页保存家里或工作室的 **2.4 GHz Wi-Fi**。板子重启，连上 Wi-Fi 并取得 IP 后会关闭配置热点。把手机或电脑接入同一局域网，访问 `http://s3-audio-xxxxxx.local/`，或在路由器的客户端列表查找设备 IP 后访问 `http://<设备IP>/`。连不上已保存的 Wi-Fi 时，板子会继续开放配置热点。
 4. 在 iPhone 或 iPad 的控制中心，从正在播放的音频输出列表选择 `S3 Audio XXXXXX`。播放视频时，画面仍在手机或平板上显示。DLNA 播放器也可从渲染器列表选择同一设备。
 
 ## 后台
@@ -36,12 +36,18 @@
 在工程目录的 ESP-IDF v6.1 PowerShell 中执行：
 
 ```powershell
-idf.py build
-idf.py -p COM7 flash
-idf.py -p COM7 monitor
+./build-local.ps1 -Action build
+./build-local.ps1 -Action flash -Port COM7
 ```
 
-安装路径匹配时也可执行 `./build-local.ps1 -Action build` 或 `./build-local.ps1 -Action flash -Port COM7`。脚本可用 -Profile 指定 ESP-IDF v6.1 PowerShell 环境。将示例中的 COM7 换成开发板的串口。依赖版本在 `dependencies.lock` 固定。应用默认使用 ESP-IDF 的 Optimize for performance（GCC -O2）。首次构建需要访问 ESP Component Registry。工程内包含 AirPlay 2 接收、WAV、FLAC 和 MP3 解码的源文件。AirPlay 2 的解码器和密码库由锁定的 ESP-IDF 组件依赖提供。
+脚本可用 `-Profile` 指定 ESP-IDF v6.1 PowerShell 环境。将示例中的 COM7 换成开发板的串口。脚本默认构建 Release，应用使用 ESP-IDF 的 Optimize for performance（GCC -O2）。首次构建需要访问 ESP Component Registry，依赖版本在 `dependencies.lock` 固定。工程内包含 AirPlay 2 接收、WAV、FLAC 和 MP3 解码的源文件。AirPlay 2 的解码器和密码库由锁定的 ESP-IDF 组件依赖提供。
+
+Release 关闭应用和 Bootloader 串口日志、FreeRTOS 运行时间统计，以及 USB 路径延迟采样和 AirPlay 播放诊断。上电时可能仍出现 ESP32-S3 芯片 ROM 的启动提示。排查问题时可用独立的 Debug 构建打开串口日志和诊断。
+
+```powershell
+./build-local.ps1 -Configuration Debug -Action flash -Port COM7
+./build-local.ps1 -Configuration Debug -Action monitor -Port COM7
+```
 
 `firmware/` 内包含同一次构建的三个镜像，可从该目录使用本机 ESP-IDF 环境直接烧录：
 
@@ -53,7 +59,7 @@ python -m esptool --chip esp32s3 -p COM7 -b 460800 write-flash --flash-mode dio 
 
 GPIO48 连接一颗 GRB 顺序的 WS2812。原生 USB OTG 口继续作为主机接 CX31993，下载和监控走独立串口。固件分区保留此前的 NVS 位置，更新时使用正常烧录命令可以保留原有配网和输出偏好。
 
-USB 写入任务与 USB Host 运行在 CPU0，DLNA 解码和 AirPlay 实时渲染在 CPU1。UAC2 使用较浅的 PCM 队列和 USB 缓冲。`/api/status` 提供最近采样的 `cpu0Load`、`cpu1Load`，以及 UAC2 播放时估算的 PCM 入队至 USB 总线延迟 `usbPathUs`。这个数值不包含发送端缓冲、网络传输或 DAC 的模拟输出延迟。
+USB 写入任务与 USB Host 运行在 CPU0，DLNA 解码和 AirPlay 实时渲染在 CPU1。UAC2 使用较浅的 PCM 队列和 USB 缓冲。Debug 构建的 `/api/status` 提供最近采样的 `cpu0Load`、`cpu1Load`，以及 UAC2 播放时估算的 PCM 入队至 USB 总线延迟 `usbPathUs`。
 
 ## 上游组件
 

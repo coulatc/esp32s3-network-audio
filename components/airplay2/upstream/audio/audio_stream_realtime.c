@@ -141,6 +141,7 @@ static void resend_sync(audio_receiver_state_t *state) {
   }
 }
 
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
 /* Once a second while packets go astray, what became of them.  queue_max is
  * the most still waiting on the socket after a read: the socket drops what
  * does not fit, so a queue near its limit means this task fell behind, and
@@ -172,6 +173,7 @@ static void resend_report(audio_receiver_state_t *state, int64_t now) {
   state->resend_queue_max = 0;
   state->resend_rejected = 0;
 }
+#endif
 
 /* Asks for the missing packets that could still play and are due to be
  * asked for; rtp_resend.h has the limits.  Runs after every packet and on
@@ -199,13 +201,16 @@ static void resend_service(audio_receiver_state_t *state, bool backlog) {
       break;
     }
   }
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
   if (n > 0) {
     state->resend_send_us += (uint32_t)(esp_timer_get_time() - now);
   }
 
   resend_report(state, now);
+#endif
 }
 
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
 /* What became of the packets, every PKT_REPORT_US while any fail to decrypt
  * or the engine is not playing them.  Only this task touches the counts. */
 #define PKT_REPORT_US 5000000LL
@@ -236,12 +241,13 @@ static void packet_report(audio_receiver_state_t *state,
   memset(&s_pkt, 0, sizeof(s_pkt));
   s_pkt.since_us = now;
 }
+#endif
 
 static bool realtime_receive_packet(audio_stream_t *stream, uint8_t *packet,
                                     struct sockaddr_in *src_addr,
                                     socklen_t *addr_len) {
   audio_receiver_state_t *state = audio_stream_state(stream);
-  packet_report(state, stream, esp_timer_get_time());
+  AUDIO_DIAGNOSTICS_ONLY(packet_report(state, stream, esp_timer_get_time()));
 
   ssize_t len = recvfrom(state->data_socket, packet, MAX_RTP_PACKET_SIZE, 0,
                          (struct sockaddr *)src_addr, addr_len);
@@ -262,12 +268,16 @@ static bool realtime_receive_packet(audio_stream_t *stream, uint8_t *packet,
   }
 
   state->stats.packets_received++;
-  s_pkt.received++;
+  AUDIO_DIAGNOSTICS_ONLY(s_pkt.received++);
   int queued = 0;
-  if (ioctl(state->data_socket, FIONREAD, &queued) == 0 &&
-      (uint32_t)queued > state->resend_queue_max) {
+  if (ioctl(state->data_socket, FIONREAD, &queued) < 0) {
+    queued = 0;
+  }
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
+  if ((uint32_t)queued > state->resend_queue_max) {
     state->resend_queue_max = (uint32_t)queued;
   }
+#endif
 
   const uint8_t *rtp_data = packet;
   size_t rtp_len = (size_t)len;
@@ -319,7 +329,7 @@ static bool realtime_receive_packet(audio_stream_t *stream, uint8_t *packet,
     if (decrypted_len < 0) {
       state->stats.decrypt_errors++;
       state->stats.packets_dropped++;
-      s_pkt.decrypt_failed++;
+      AUDIO_DIAGNOSTICS_ONLY(s_pkt.decrypt_failed++);
       return true;
     }
     audio_data = state->decrypt_buffer;
@@ -328,10 +338,10 @@ static bool realtime_receive_packet(audio_stream_t *stream, uint8_t *packet,
 
   if (!audio_stream_process_frame(state, timestamp, audio_data, audio_len)) {
     state->stats.packets_dropped++;
-    state->resend_rejected++;
-    s_pkt.rejected++;
+    AUDIO_DIAGNOSTICS_ONLY(state->resend_rejected++);
+    AUDIO_DIAGNOSTICS_ONLY(s_pkt.rejected++);
   } else {
-    s_pkt.accepted++;
+    AUDIO_DIAGNOSTICS_ONLY(s_pkt.accepted++);
   }
 
   return true;

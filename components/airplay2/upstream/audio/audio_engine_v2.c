@@ -18,9 +18,11 @@ static const char *TAG = "audio_v2";
  * consumer never signals. */
 #define AUDIO_V2_PUSH_WAIT_SLICE_MS 50U
 
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
 /* Startup watchdog: first report, then the interval between repeats. */
 #define START_STALL_AFTER_US  3000000LL
 #define START_STALL_REPEAT_US 10000000LL
+#endif
 
 static uint32_t default_preroll_samples(int sample_rate) {
   return (uint32_t)((uint64_t)sample_rate * 180U / 1000U);
@@ -81,6 +83,7 @@ uint32_t audio_engine_v2_begin_epoch(audio_engine_v2_t *engine,
   audio_timeline_signal_space(&engine->timeline);
   audio_clock_map_reset(&engine->clock_map);
   audio_scheduler_begin_epoch(&engine->scheduler, next, now_us);
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
   engine->concealed_samples = 0;
   engine->blocks_inserted = 0;
   engine->blocks_rejected = 0;
@@ -107,6 +110,7 @@ uint32_t audio_engine_v2_begin_epoch(audio_engine_v2_t *engine,
   engine->start_watchdog_report_us = 0;
   engine->start_watchdog_epoch = next;
   engine->start_watchdog_anchor_rtp = 0;
+#endif
   ESP_LOGI(TAG, "new epoch=%" PRIu32, next);
   return next;
 }
@@ -149,6 +153,7 @@ bool audio_engine_v2_set_frame_samples(audio_engine_v2_t *engine,
   return true;
 }
 
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
 /* Startup watchdog report.  Logs the engine's state once a start has waited
  * START_STALL_AFTER_US past its first anchor, then every
  * START_STALL_REPEAT_US for as long as it stays stuck.  Called from the
@@ -208,6 +213,7 @@ static void start_watchdog_check(audio_engine_v2_t *engine, int64_t now_us) {
            __atomic_load_n(&engine->diag_decode_fail, __ATOMIC_RELAXED),
            __atomic_load_n(&engine->diag_pcm_inserted, __ATOMIC_RELAXED));
 }
+#endif
 
 bool audio_engine_v2_set_anchor(audio_engine_v2_t *engine, uint32_t anchor_rtp,
                                 uint64_t anchor_network_ns,
@@ -223,6 +229,7 @@ bool audio_engine_v2_set_anchor(audio_engine_v2_t *engine, uint32_t anchor_rtp,
       engine->scheduler.state = AUDIO_SCHED_PREROLL;
       engine->scheduler.wait_reason = AUDIO_SCHED_WAIT_PREROLL;
     }
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
     /* A realtime sender re-anchors every second or so.  Timing the stall
      * from the latest anchor would restart the clock each time and the
      * watchdog would never fire, so it runs from the attempt's first. */
@@ -236,6 +243,7 @@ bool audio_engine_v2_set_anchor(audio_engine_v2_t *engine, uint32_t anchor_rtp,
       engine->start_watchdog_anchor_rtp = anchor_rtp;
     }
     start_watchdog_check(engine, now_us);
+#endif
   }
   return ok;
 }
@@ -279,7 +287,7 @@ void audio_engine_v2_set_playing(audio_engine_v2_t *engine, bool playing) {
   engine->playing = playing;
 
   if (!playing) {
-    engine->start_watchdog_armed = false;
+    AUDIO_DIAGNOSTICS_ONLY(engine->start_watchdog_armed = false);
     if (engine->scheduler.state != AUDIO_SCHED_PAUSED) {
       audio_scheduler_set_paused(&engine->scheduler, true);
     }
@@ -361,14 +369,14 @@ bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
   portENTER_CRITICAL(&engine->publish_lock);
 
   if (!audio_epoch_matches(&engine->epoch, epoch)) {
-    engine->blocks_rejected++;
+    AUDIO_DIAGNOSTICS_ONLY(engine->blocks_rejected++);
     portEXIT_CRITICAL(&engine->publish_lock);
     return false;
   }
 
   if (!audio_timeline_reserve(&engine->timeline, epoch, first_rtp, &reservation,
                               &timeline_pcm)) {
-    engine->blocks_rejected++;
+    AUDIO_DIAGNOSTICS_ONLY(engine->blocks_rejected++);
     portEXIT_CRITICAL(&engine->publish_lock);
     return false;
   }
@@ -376,8 +384,8 @@ bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
   /* A retransmitted/duplicate block that is already READY needs no second
    * payload copy.  Treat it exactly like the previous insert() no-op path. */
   if (reservation.duplicate) {
-    engine->blocks_inserted++;
-    (void)__atomic_add_fetch(&engine->diag_pcm_inserted, 1U, __ATOMIC_RELAXED);
+    AUDIO_DIAGNOSTICS_ONLY(engine->blocks_inserted++);
+    AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(&engine->diag_pcm_inserted, 1U, __ATOMIC_RELAXED));
     portEXIT_CRITICAL(&engine->publish_lock);
     return true;
   }
@@ -402,20 +410,20 @@ bool audio_engine_v2_push_pcm(audio_engine_v2_t *engine, uint32_t epoch,
 
   if (!audio_epoch_matches(&engine->epoch, epoch)) {
     audio_timeline_cancel(&engine->timeline, &reservation);
-    engine->blocks_rejected++;
+    AUDIO_DIAGNOSTICS_ONLY(engine->blocks_rejected++);
     portEXIT_CRITICAL(&engine->publish_lock);
     return false;
   }
 
   if (!audio_timeline_commit(&engine->timeline, &reservation)) {
     /* commit() consumes/cancels a valid reservation on every terminal path. */
-    engine->blocks_rejected++;
+    AUDIO_DIAGNOSTICS_ONLY(engine->blocks_rejected++);
     portEXIT_CRITICAL(&engine->publish_lock);
     return false;
   }
 
-  engine->blocks_inserted++;
-  (void)__atomic_add_fetch(&engine->diag_pcm_inserted, 1U, __ATOMIC_RELAXED);
+  AUDIO_DIAGNOSTICS_ONLY(engine->blocks_inserted++);
+  AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(&engine->diag_pcm_inserted, 1U, __ATOMIC_RELAXED));
 
   portEXIT_CRITICAL(&engine->publish_lock);
   return true;
@@ -486,20 +494,25 @@ size_t audio_engine_v2_render(audio_engine_v2_t *engine,
   if (!engine || !engine->initialized || !out || samples == 0U) {
     return 0;
   }
-  __atomic_add_fetch(&engine->render_calls, 1, __ATOMIC_RELAXED);
+  AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(&engine->render_calls, 1, __ATOMIC_RELAXED));
   if (!engine->playing) {
     memset(out, 0, samples * engine->format.channels * sizeof(int16_t));
-    start_watchdog_check(engine, esp_timer_get_time());
+    AUDIO_DIAGNOSTICS_ONLY(start_watchdog_check(engine, esp_timer_get_time()));
     return samples;
   }
 
+  size_t *concealed_samples = NULL;
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
   const audio_scheduler_state_t state_before = engine->scheduler.state;
   const uint32_t cursor_before = engine->scheduler.cursor_rtp;
   size_t concealed = 0;
+  concealed_samples = &concealed;
+#endif
   size_t produced = audio_scheduler_render(
       &engine->scheduler, &engine->timeline, &engine->clock_map,
       output_network_ns, out, samples, (uint8_t)engine->format.channels,
-      &concealed);
+      concealed_samples);
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
   if (engine->scheduler.state == AUDIO_SCHED_PLAYING) {
     engine->start_watchdog_armed = false;
   }
@@ -577,5 +590,6 @@ size_t audio_engine_v2_render(audio_engine_v2_t *engine,
              (unsigned)audio_timeline_count(&engine->timeline),
              engine->concealed_samples, engine->conceal_events, new_conceals);
   }
+#endif
   return produced;
 }

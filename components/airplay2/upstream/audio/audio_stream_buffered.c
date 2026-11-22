@@ -148,16 +148,16 @@ static void buffered_audio_task(void *pvParameters) {
       // gate and the decode invalidates this packet rather than letting it
       // reach the timeline of the new segment.
       const uint32_t epoch = audio_epoch_get(&state->engine_v2.epoch);
-      (void)__atomic_add_fetch(&state->engine_v2.diag_rx_packets, 1U,
-                               __ATOMIC_RELAXED);
+      AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(
+          &state->engine_v2.diag_rx_packets, 1U, __ATOMIC_RELAXED));
 
       // Drop stale pre-seek/old-track packets before AES and AAC work.  The
       // bytes still have to be drained from TCP (done above), but they no
       // longer consume decoder time or enter the PCM ring buffer.
       if (!audio_stream_accept_timestamp(state, timestamp)) {
         state->stats.packets_dropped++;
-        (void)__atomic_add_fetch(&state->engine_v2.diag_gate_drops, 1U,
-                                 __ATOMIC_RELAXED);
+        AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(
+            &state->engine_v2.diag_gate_drops, 1U, __ATOMIC_RELAXED));
         continue;
       }
 
@@ -197,14 +197,14 @@ static void buffered_audio_task(void *pvParameters) {
       const audio_decode_enqueue_result_t enq = audio_decode_worker_enqueue(
           state->decode_worker, &encoded, BUFFERED_ENQUEUE_TIMEOUT_MS);
       if (enq == AUDIO_DECODE_ENQUEUE_OK) {
-        (void)__atomic_add_fetch(&state->engine_v2.diag_enqueue_ok, 1U,
-                                 __ATOMIC_RELAXED);
+        AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(
+            &state->engine_v2.diag_enqueue_ok, 1U, __ATOMIC_RELAXED));
       } else {
         state->stats.packets_dropped++;
-        (void)__atomic_add_fetch(enq == AUDIO_DECODE_ENQUEUE_RETRY
-                                     ? &state->engine_v2.diag_enqueue_retries
-                                     : &state->engine_v2.diag_queue_drops,
-                                 1U, __ATOMIC_RELAXED);
+        AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(
+            enq == AUDIO_DECODE_ENQUEUE_RETRY ? &state->engine_v2.diag_enqueue_retries
+                                             : &state->engine_v2.diag_queue_drops,
+            1U, __ATOMIC_RELAXED));
       }
     }
 

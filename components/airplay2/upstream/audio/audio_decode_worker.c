@@ -104,8 +104,8 @@ static void decode_task(void *arg) {
       continue;
     }
 
-    (void)__atomic_add_fetch(&worker->state->engine_v2.diag_dequeued, 1U,
-                             __ATOMIC_RELAXED);
+    AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(
+        &worker->state->engine_v2.diag_dequeued, 1U, __ATOMIC_RELAXED));
 
     const uint32_t current_generation =
         __atomic_load_n(&worker->cancel_generation, __ATOMIC_ACQUIRE);
@@ -121,8 +121,8 @@ static void decode_task(void *arg) {
       }
     } else {
       worker->state->stats.packets_dropped++;
-      (void)__atomic_add_fetch(&worker->state->engine_v2.diag_epoch_drops, 1U,
-                               __ATOMIC_RELAXED);
+      AUDIO_DIAGNOSTICS_ONLY(__atomic_add_fetch(
+          &worker->state->engine_v2.diag_epoch_drops, 1U, __ATOMIC_RELAXED));
     }
 
     job_free(job);

@@ -8,12 +8,19 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "sdkconfig.h"
 
 #include "audio_clock_map.h"
 #include "audio_epoch.h"
 #include "audio_receiver.h"
 #include "audio_scheduler.h"
 #include "audio_timeline.h"
+
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
+#define AUDIO_DIAGNOSTICS_ONLY(expression) ((void)(expression))
+#else
+#define AUDIO_DIAGNOSTICS_ONLY(expression) ((void)0)
+#endif
 
 typedef struct {
   audio_epoch_t epoch;
@@ -23,6 +30,7 @@ typedef struct {
   audio_format_t format;
   bool initialized;
   bool playing;
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
   uint64_t blocks_inserted;
   uint64_t blocks_rejected;
   uint64_t concealed_samples;
@@ -58,6 +66,7 @@ typedef struct {
   int64_t start_watchdog_report_us;
   uint32_t start_watchdog_epoch;
   uint32_t start_watchdog_anchor_rtp;
+#endif
 
   /* Short publication gate shared by epoch changes and PCM insertion. */
   portMUX_TYPE publish_lock;

@@ -31,7 +31,9 @@ typedef struct {
 
 typedef struct {
     uint32_t generation;
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
     uint32_t queued_at_us;
+#endif
     audio_source_t source;
     size_t length;
     uint8_t data[PCM_BLOCK_SIZE];
@@ -43,7 +45,10 @@ static const uint32_t rates[] = {44100, 48000, 32000, 88200, 96000, 24000, 22050
 static QueueHandle_t connections, pcm_queue;
 static SemaphoreHandle_t lock;
 static atomic_uint generation = 1, active_encoding, written_bytes, written_gain;
-static atomic_uint usb_path_us, usb_underrun_bytes, usb_write_errors, pcm_queue_drops;
+static atomic_uint usb_write_errors, pcm_queue_drops;
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
+static atomic_uint usb_path_us, usb_underrun_bytes;
+#endif
 static atomic_int owner = -1;
 static atomic_bool detached, stream_failed;
 static audio_format_t preferred, supported[MAX_FORMATS];
@@ -288,7 +293,9 @@ static void process_device(connection_t connection)
     uint32_t output_generation = 0;
     unsigned current_gain = 0;
     bool reported_pcm = false;
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
     int64_t next_usb_sample = 0;
+#endif
     while (!atomic_load(&detached)) {
         xSemaphoreTake(lock, portMAX_DELAY);
         audio_format_t target = preferred;
@@ -355,6 +362,7 @@ static void process_device(connection_t connection)
                 }
                 audio_meter_feed(block.data, block.length, format.rate, format.bytes,
                                  block.generation, now / 1000);
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
                 if (two && now >= next_usb_sample) {
                     next_usb_sample = now + 50000;
                     uac2_host_buffer_status_t buf;
@@ -365,6 +373,7 @@ static void process_device(connection_t connection)
                         atomic_store(&usb_underrun_bytes, buf.underrun_bytes);
                     }
                 }
+#endif
             } else {
                 atomic_fetch_add(&usb_write_errors, 1);
             }
@@ -488,7 +497,9 @@ static bool queue_block(audio_source_t source, pcm_block_t *block)
     // writer a brief chance to drain a full queue without waiting a full block.
     TickType_t wait = pdMS_TO_TICKS(source == AUDIO_DLNA ? 75 : 3);
     if (!audio_is_owner(source) || block->generation != atomic_load(&generation)) return false;
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
     block->queued_at_us = (uint32_t)esp_timer_get_time();
+#endif
     if (xQueueSend(pcm_queue, block, wait) == pdTRUE) {
         block->length = 0;
         return true;
@@ -597,10 +608,12 @@ void audio_status(cJSON *status)
     cJSON_AddNumberToObject(status, "usbBytesWritten", atomic_load(&written_bytes));
     cJSON_AddNumberToObject(status, "usbWriteErrors", atomic_load(&usb_write_errors));
     cJSON_AddNumberToObject(status, "pcmQueueDrops", atomic_load(&pcm_queue_drops));
+#ifdef CONFIG_S3_AUDIO_DIAGNOSTICS
     if (audio_ready() && active_class == UAC2 && atomic_load(&owner) >= 0) {
         cJSON_AddNumberToObject(status, "usbPathUs", atomic_load(&usb_path_us));
         cJSON_AddNumberToObject(status, "usbUnderrunBytes", atomic_load(&usb_underrun_bytes));
     }
+#endif
     double gain = audio_ready() && atomic_load(&owner) >= 0 ? atomic_load(&written_gain) : 0;
     cJSON_AddNumberToObject(status, "usbVolumePercent", gain * 100 / VOLUME_UNITY);
     audio_format_t active = decode_format(atomic_load(&active_encoding));

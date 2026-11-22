@@ -1,0 +1,8 @@
+menu "S3 Audio"
+    config S3_AUDIO_DIAGNOSTICS
+        bool "Collect USB and AirPlay playback diagnostics"
+        default n
+        help
+            Measure USB queue latency and record AirPlay playback statistics
+            for troubleshooting.
+endmenu
